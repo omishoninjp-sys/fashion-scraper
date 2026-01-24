@@ -856,6 +856,18 @@ def run_scrape():
                 scrape_status['skipped'] += 1
                 continue
             
+            # 檢查庫存（至少有一個 variant 有庫存才上架）
+            has_stock = False
+            for v in variants:
+                if v.get('available', False):
+                    has_stock = True
+                    break
+            
+            if not has_stock:
+                print(f"[跳過] 無庫存: {title}")
+                scrape_status['skipped'] += 1
+                continue
+            
             result = upload_to_shopify(product, collection_id)
             
             if result['success']:

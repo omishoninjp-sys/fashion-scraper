@@ -225,7 +225,7 @@ def download_image_to_base64(img_url, max_retries=3):
 
 def get_collection_products_with_details(collection_id):
     """取得 Collection 內的商品（包含 variants 詳細資訊，用於價格比對）"""
-    products_map = {}  # handle -> {product_id, variants: [{variant_id, price, sku, option1, option2, option3}]}
+    products_map = {}  # handle -> {product_id, variants: [{variant_id, price, cost, sku, option1, option2, option3}]}
     if not collection_id:
         return products_map
     
@@ -243,9 +243,23 @@ def get_collection_products_with_details(collection_id):
             if handle and product_id:
                 variants_info = []
                 for v in product.get('variants', []):
+                    variant_id = v.get('id')
+                    cost = None
+                    
+                    # 額外取得 variant 的 cost（collection products API 不含 cost）
+                    variant_response = requests.get(
+                        shopify_api_url(f"variants/{variant_id}.json"),
+                        headers=get_shopify_headers()
+                    )
+                    if variant_response.status_code == 200:
+                        variant_data = variant_response.json().get('variant', {})
+                        cost = variant_data.get('cost')
+                    time.sleep(0.1)  # 避免 API 限制
+                    
                     variants_info.append({
-                        'variant_id': v.get('id'),
+                        'variant_id': variant_id,
                         'price': v.get('price'),
+                        'cost': cost,
                         'sku': v.get('sku'),
                         'option1': v.get('option1'),
                         'option2': v.get('option2'),
@@ -505,7 +519,7 @@ def check_product_stock(product):
 
 
 def update_product_prices(source_product, existing_product_info):
-    """比對並更新商品價格（如果有變動）"""
+    """比對並更新商品價格（官網價格 vs Shopify 成本價）"""
     product_id = existing_product_info['product_id']
     existing_variants = existing_product_info['variants']
     source_variants = source_product.get('variants', [])
@@ -524,17 +538,21 @@ def update_product_prices(source_product, existing_product_info):
         if key in existing_variant_map:
             ev = existing_variant_map[key]
             
-            # 計算新售價
+            # 官網價格（進貨成本）
             source_cost = float(sv.get('price', 0))
-            weight = float(sv.get('grams', 0)) / 1000 if sv.get('grams') else DEFAULT_WEIGHT
-            new_selling_price = calculate_selling_price(source_cost, weight)
             
-            # 比對現有價格
-            current_price = float(ev.get('price', 0))
+            # Shopify 現有成本價
+            shopify_cost = float(ev.get('cost', 0)) if ev.get('cost') else 0
             
-            if abs(new_selling_price - current_price) >= 1:  # 價格差異 >= 1 才更新
+            # 比對：官網價格 vs Shopify 成本價
+            if abs(source_cost - shopify_cost) >= 1:  # 成本價差異 >= 1 才更新
                 variant_id = ev['variant_id']
-                print(f"[價格更新] Variant {variant_id}: ¥{current_price} -> ¥{new_selling_price}")
+                
+                # 重新計算售價
+                weight = float(sv.get('grams', 0)) / 1000 if sv.get('grams') else DEFAULT_WEIGHT
+                new_selling_price = calculate_selling_price(source_cost, weight)
+                
+                print(f"[價格更新] Variant {variant_id}: 成本 ¥{shopify_cost} -> ¥{source_cost}, 售價更新為 ¥{new_selling_price}")
                 
                 # 更新價格和成本
                 response = requests.put(

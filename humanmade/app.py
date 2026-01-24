@@ -5,7 +5,9 @@ Human Made 商品爬蟲 + Shopify 上架工具
 2. 完整複製 Variants（顏色、尺寸等選項）
 3. 圖片對應 Variant
 4. 每個 Variant 獨立計算售價
-5. 上架到 Shopify
+5. 無庫存商品不上架，已上架但無庫存的設為草稿
+6. 價格同步：已存在商品若價格變動則自動更新
+7. Collection 建立後發布到所有 channels
 """
 
 from flask import Flask, jsonify
@@ -46,7 +48,9 @@ scrape_status = {
     "skipped": 0,
     "skipped_exists": 0,
     "filtered_by_price": 0,
-    "deleted": 0
+    "out_of_stock": 0,
+    "set_to_draft": 0,
+    "price_updated": 0
 }
 
 
@@ -190,7 +194,6 @@ def download_image_to_base64(img_url, max_retries=3):
         'Referer': SOURCE_URL + '/',
     }
     
-    # 確保使用較大尺寸的圖片
     if '_small' in img_url or '_thumbnail' in img_url:
         img_url = re.sub(r'_\d+x\d*\.', '.', img_url)
         img_url = re.sub(r'_(small|thumbnail|medium)\.', '.', img_url)
@@ -220,41 +223,9 @@ def download_image_to_base64(img_url, max_retries=3):
     return {'success': False}
 
 
-def get_existing_products_map():
-    products_map = {}
-    url = shopify_api_url("products.json?limit=250")
-    
-    while url:
-        response = requests.get(url, headers=get_shopify_headers())
-        if response.status_code != 200:
-            print(f"Error fetching products: {response.status_code}")
-            break
-        
-        data = response.json()
-        for product in data.get('products', []):
-            product_id = product.get('id')
-            # 用 handle 作為唯一識別（因為 variants 可能有多個 SKU）
-            handle = product.get('handle')
-            if handle and product_id:
-                products_map[handle] = product_id
-            # 也記錄 SKU
-            for variant in product.get('variants', []):
-                sku = variant.get('sku')
-                if sku and product_id:
-                    products_map[f"sku:{sku}"] = product_id
-        
-        link_header = response.headers.get('Link', '')
-        if 'rel="next"' in link_header:
-            match = re.search(r'<([^>]+)>; rel="next"', link_header)
-            url = match.group(1) if match else None
-        else:
-            url = None
-    
-    return products_map
-
-
-def get_collection_products_map(collection_id):
-    products_map = {}
+def get_collection_products_with_details(collection_id):
+    """取得 Collection 內的商品（包含 variants 詳細資訊，用於價格比對）"""
+    products_map = {}  # handle -> {product_id, variants: [{variant_id, price, sku, option1, option2, option3}]}
     if not collection_id:
         return products_map
     
@@ -270,7 +241,20 @@ def get_collection_products_map(collection_id):
             product_id = product.get('id')
             handle = product.get('handle')
             if handle and product_id:
-                products_map[handle] = product_id
+                variants_info = []
+                for v in product.get('variants', []):
+                    variants_info.append({
+                        'variant_id': v.get('id'),
+                        'price': v.get('price'),
+                        'sku': v.get('sku'),
+                        'option1': v.get('option1'),
+                        'option2': v.get('option2'),
+                        'option3': v.get('option3'),
+                    })
+                products_map[handle] = {
+                    'product_id': product_id,
+                    'variants': variants_info
+                }
         
         link_header = response.headers.get('Link', '')
         if 'rel="next"' in link_header:
@@ -294,6 +278,79 @@ def set_product_to_draft(product_id):
     return False
 
 
+def publish_collection_to_all_channels(collection_id):
+    """發布 Collection 到所有銷售渠道"""
+    print(f"[發布] 正在發布 Collection {collection_id} 到所有渠道...")
+    
+    graphql_url = f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/graphql.json"
+    headers = {
+        'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+        'Content-Type': 'application/json',
+    }
+    
+    query = """
+    {
+      publications(first: 20) {
+        edges {
+          node {
+            id
+            name
+          }
+        }
+      }
+    }
+    """
+    
+    response = requests.post(graphql_url, headers=headers, json={'query': query})
+    
+    if response.status_code != 200:
+        print(f"[發布] 無法取得渠道列表: {response.status_code}")
+        return False
+    
+    result = response.json()
+    publications = result.get('data', {}).get('publications', {}).get('edges', [])
+    
+    seen_names = set()
+    unique_publications = []
+    for pub in publications:
+        name = pub['node']['name']
+        if name not in seen_names:
+            seen_names.add(name)
+            unique_publications.append(pub['node'])
+    
+    print(f"[發布] 找到 {len(unique_publications)} 個銷售渠道")
+    
+    publication_inputs = [{"publicationId": pub['id']} for pub in unique_publications]
+    
+    mutation = """
+    mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+      publishablePublish(id: $id, input: $input) {
+        publishable {
+          availablePublicationsCount { count }
+        }
+        userErrors { field message }
+      }
+    }
+    """
+    
+    variables = {
+        "id": f"gid://shopify/Collection/{collection_id}",
+        "input": publication_inputs
+    }
+    
+    pub_response = requests.post(graphql_url, headers=headers, json={
+        'query': mutation,
+        'variables': variables
+    })
+    
+    if pub_response.status_code == 200:
+        print(f"[發布] Collection 已發布到所有渠道")
+        return True
+    else:
+        print(f"[發布] 發布失敗: {pub_response.text}")
+        return False
+
+
 def get_or_create_collection(collection_title="Human Made"):
     response = requests.get(
         shopify_api_url(f'custom_collections.json?title={collection_title}'),
@@ -305,6 +362,7 @@ def get_or_create_collection(collection_title="Human Made"):
         for col in collections:
             if col['title'] == collection_title:
                 print(f"[INFO] 找到現有 Collection: {collection_title} (ID: {col['id']})")
+                publish_collection_to_all_channels(col['id'])
                 return col['id']
     
     response = requests.post(
@@ -316,6 +374,7 @@ def get_or_create_collection(collection_title="Human Made"):
     if response.status_code == 201:
         collection_id = response.json()['custom_collection']['id']
         print(f"[INFO] 建立新 Collection: {collection_title} (ID: {collection_id})")
+        publish_collection_to_all_channels(collection_id)
         return collection_id
     
     print(f"[ERROR] 無法建立 Collection: {response.text}")
@@ -436,6 +495,68 @@ def fetch_all_products():
     return products
 
 
+def check_product_stock(product):
+    """檢查商品是否有庫存（任一 variant 有庫存即可）"""
+    variants = product.get('variants', [])
+    for v in variants:
+        if v.get('available', False):
+            return True
+    return False
+
+
+def update_product_prices(source_product, existing_product_info):
+    """比對並更新商品價格（如果有變動）"""
+    product_id = existing_product_info['product_id']
+    existing_variants = existing_product_info['variants']
+    source_variants = source_product.get('variants', [])
+    
+    updated = False
+    
+    # 建立 existing variants 的查找表（用 option1+option2+option3 作為 key）
+    existing_variant_map = {}
+    for ev in existing_variants:
+        key = f"{ev.get('option1', '')}|{ev.get('option2', '')}|{ev.get('option3', '')}"
+        existing_variant_map[key] = ev
+    
+    for sv in source_variants:
+        key = f"{sv.get('option1', '')}|{sv.get('option2', '')}|{sv.get('option3', '')}"
+        
+        if key in existing_variant_map:
+            ev = existing_variant_map[key]
+            
+            # 計算新售價
+            source_cost = float(sv.get('price', 0))
+            weight = float(sv.get('grams', 0)) / 1000 if sv.get('grams') else DEFAULT_WEIGHT
+            new_selling_price = calculate_selling_price(source_cost, weight)
+            
+            # 比對現有價格
+            current_price = float(ev.get('price', 0))
+            
+            if abs(new_selling_price - current_price) >= 1:  # 價格差異 >= 1 才更新
+                variant_id = ev['variant_id']
+                print(f"[價格更新] Variant {variant_id}: ¥{current_price} -> ¥{new_selling_price}")
+                
+                # 更新價格和成本
+                response = requests.put(
+                    shopify_api_url(f"variants/{variant_id}.json"),
+                    headers=get_shopify_headers(),
+                    json={
+                        'variant': {
+                            'id': variant_id,
+                            'price': f"{new_selling_price:.2f}",
+                            'cost': f"{source_cost:.2f}"
+                        }
+                    }
+                )
+                
+                if response.status_code == 200:
+                    updated = True
+                else:
+                    print(f"[價格更新] 更新失敗: {response.text}")
+    
+    return updated
+
+
 def upload_to_shopify(source_product, collection_id=None):
     """上傳商品到 Shopify（含 Variants）"""
     
@@ -479,7 +600,6 @@ def upload_to_shopify(source_product, collection_id=None):
             'requires_shipping': True,
         }
         
-        # 選項值
         if sv.get('option1'):
             variant_data['option1'] = sv.get('option1')
         if sv.get('option2'):
@@ -491,13 +611,13 @@ def upload_to_shopify(source_product, collection_id=None):
             'variant_data': variant_data,
             'cost': cost,
             'source_id': sv.get('id'),
-            'image_id': sv.get('image_id'),  # 原圖片 ID（稍後對應）
+            'image_id': sv.get('image_id'),
         })
     
     # 處理圖片
     source_images = source_product.get('images', [])
     images_base64 = []
-    image_id_to_position = {}  # 原圖片 ID -> 新位置
+    image_id_to_position = {}
     
     print(f"[圖片] 開始下載 {len(source_images)} 張圖片...")
     
@@ -506,7 +626,6 @@ def upload_to_shopify(source_product, collection_id=None):
         if not img_url:
             continue
         
-        # 確保 https
         if img_url.startswith('//'):
             img_url = 'https:' + img_url
         
@@ -520,7 +639,6 @@ def upload_to_shopify(source_product, collection_id=None):
                 'filename': f"humanmade_{handle}_{idx+1}.jpg"
             }
             
-            # 記錄原圖片 ID 對應的 variant_ids
             source_variant_ids = img.get('variant_ids', [])
             if source_variant_ids:
                 image_data['_source_variant_ids'] = source_variant_ids
@@ -535,7 +653,6 @@ def upload_to_shopify(source_product, collection_id=None):
     
     print(f"[圖片] 成功下載 {len(images_base64)}/{len(source_images)} 張圖片")
     
-    # 準備上傳資料（先不含 variant 圖片對應）
     images_for_upload = []
     for img in images_base64:
         upload_img = {
@@ -598,13 +715,11 @@ def upload_to_shopify(source_product, collection_id=None):
                 )
         
         # 圖片與 Variant 對應
-        # 建立 source variant id -> created variant id 的映射
         source_to_created_variant = {}
         for idx, sv in enumerate(source_variants):
             if idx < len(created_variants):
                 source_to_created_variant[sv.get('id')] = created_variants[idx]['id']
         
-        # 更新圖片的 variant_ids
         for idx, created_img in enumerate(created_images):
             if idx < len(images_base64):
                 source_variant_ids = images_base64[idx].get('_source_variant_ids', [])
@@ -664,9 +779,9 @@ def index():
         .status {{ padding: 10px; background: #f8f9fa; border-radius: 5px; margin-top: 10px; }}
         .log {{ max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 13px; background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 5px; }}
         .stats {{ display: flex; gap: 15px; margin-top: 15px; flex-wrap: wrap; }}
-        .stat {{ flex: 1; min-width: 100px; text-align: center; padding: 15px; background: #f8f9fa; border-radius: 5px; }}
+        .stat {{ flex: 1; min-width: 80px; text-align: center; padding: 15px; background: #f8f9fa; border-radius: 5px; }}
         .stat-number {{ font-size: 24px; font-weight: bold; color: #E74C3C; }}
-        .stat-label {{ font-size: 12px; color: #666; margin-top: 5px; }}
+        .stat-label {{ font-size: 11px; color: #666; margin-top: 5px; }}
     </style>
 </head>
 <body>
@@ -681,7 +796,8 @@ def index():
     <div class="card">
         <h3>開始爬取</h3>
         <p>爬取 humanmade.jp 所有商品並上架到 Shopify（含 Variants）</p>
-        <p style="color: #666; font-size: 14px;">※ 成本價低於 ¥1000 的商品將自動跳過</p>
+        <p style="color: #666; font-size: 14px;">※ 成本價低於 ¥1000 或無庫存的商品將自動跳過</p>
+        <p style="color: #666; font-size: 14px;">※ 已存在商品會自動同步價格</p>
         <button class="btn" id="startBtn" onclick="startScrape()">🚀 開始爬取</button>
         
         <div id="progressSection" style="display: none;">
@@ -696,6 +812,10 @@ def index():
                     <div class="stat-label">已上架</div>
                 </div>
                 <div class="stat">
+                    <div class="stat-number" id="priceUpdatedCount" style="color: #3498db;">0</div>
+                    <div class="stat-label">價格更新</div>
+                </div>
+                <div class="stat">
                     <div class="stat-number" id="skippedCount">0</div>
                     <div class="stat-label">已跳過</div>
                 </div>
@@ -704,7 +824,11 @@ def index():
                     <div class="stat-label">價格過濾</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-number" id="deletedCount" style="color: #e67e22;">0</div>
+                    <div class="stat-number" id="outOfStockCount">0</div>
+                    <div class="stat-label">無庫存</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number" id="draftCount" style="color: #e67e22;">0</div>
                     <div class="stat-label">設為草稿</div>
                 </div>
                 <div class="stat">
@@ -759,9 +883,11 @@ def index():
                 document.getElementById('progressFill').style.width = percent + '%';
                 document.getElementById('statusText').textContent = data.current_product + ' (' + data.progress + '/' + data.total + ')';
                 document.getElementById('uploadedCount').textContent = data.uploaded;
+                document.getElementById('priceUpdatedCount').textContent = data.price_updated || 0;
                 document.getElementById('skippedCount').textContent = data.skipped;
                 document.getElementById('filteredCount').textContent = data.filtered_by_price || 0;
-                document.getElementById('deletedCount').textContent = data.deleted || 0;
+                document.getElementById('outOfStockCount').textContent = data.out_of_stock || 0;
+                document.getElementById('draftCount').textContent = data.set_to_draft || 0;
                 document.getElementById('errorCount').textContent = data.errors.length;
                 if (!data.running && data.progress > 0) {{
                     clearInterval(pollInterval);
@@ -811,15 +937,17 @@ def run_scrape():
             "skipped": 0,
             "skipped_exists": 0,
             "filtered_by_price": 0,
-            "deleted": 0
+            "out_of_stock": 0,
+            "set_to_draft": 0,
+            "price_updated": 0
         }
         
         scrape_status['current_product'] = "正在設定 Collection..."
         collection_id = get_or_create_collection("Human Made")
         print(f"[INFO] Collection ID: {collection_id}")
         
-        scrape_status['current_product'] = "正在取得 Collection 內商品..."
-        collection_products_map = get_collection_products_map(collection_id)
+        scrape_status['current_product'] = "正在取得 Collection 內商品（含價格資訊）..."
+        collection_products_map = get_collection_products_with_details(collection_id)
         existing_handles = set(collection_products_map.keys())
         print(f"[INFO] Collection 內有 {len(existing_handles)} 個商品")
         
@@ -828,22 +956,42 @@ def run_scrape():
         scrape_status['total'] = len(product_list)
         print(f"[INFO] 找到 {len(product_list)} 個商品")
         
-        website_handles = set(f"humanmade-{p.get('handle', '')}" for p in product_list)
+        # 記錄有庫存的商品 handle
+        in_stock_handles = set()
         
         for idx, product in enumerate(product_list):
             scrape_status['progress'] = idx + 1
             handle = product.get('handle', '')
             title = product.get('title', '')
+            my_handle = f"humanmade-{handle}"
             scrape_status['current_product'] = f"處理中: {title[:30]}"
             
+            # 檢查庫存
+            has_stock = check_product_stock(product)
+            
+            if has_stock:
+                in_stock_handles.add(my_handle)
+            
             # 檢查是否已存在
-            if f"humanmade-{handle}" in existing_handles:
-                print(f"[跳過] 已存在: {handle}")
-                scrape_status['skipped_exists'] += 1
-                scrape_status['skipped'] += 1
+            if my_handle in existing_handles:
+                existing_info = collection_products_map[my_handle]
+                
+                if has_stock:
+                    # 已存在且有庫存 -> 檢查並更新價格
+                    scrape_status['current_product'] = f"檢查價格: {title[:30]}"
+                    if update_product_prices(product, existing_info):
+                        print(f"[價格同步] {title}")
+                        scrape_status['price_updated'] += 1
+                    else:
+                        print(f"[跳過] 已存在，價格無變動: {handle}")
+                    scrape_status['skipped_exists'] += 1
+                    scrape_status['skipped'] += 1
+                else:
+                    print(f"[跳過] 已存在但無庫存（稍後設為草稿）: {handle}")
+                    scrape_status['skipped'] += 1
                 continue
             
-            # 檢查最低價格（取所有 variants 的最低價）
+            # 檢查最低價格
             variants = product.get('variants', [])
             if variants:
                 min_price = min(float(v.get('price', 0)) for v in variants)
@@ -856,15 +1004,10 @@ def run_scrape():
                 scrape_status['skipped'] += 1
                 continue
             
-            # 檢查庫存（至少有一個 variant 有庫存才上架）
-            has_stock = False
-            for v in variants:
-                if v.get('available', False):
-                    has_stock = True
-                    break
-            
+            # 檢查庫存（新商品）
             if not has_stock:
                 print(f"[跳過] 無庫存: {title}")
+                scrape_status['out_of_stock'] += 1
                 scrape_status['skipped'] += 1
                 continue
             
@@ -892,20 +1035,16 @@ def run_scrape():
             
             time.sleep(1)
         
-        # 設為草稿
-        scrape_status['current_product'] = "正在檢查已下架商品..."
-        handles_to_draft = existing_handles - website_handles
+        # 設為草稿：已存在但現在無庫存或官網下架的商品
+        scrape_status['current_product'] = "正在檢查需要設為草稿的商品..."
         
-        if handles_to_draft:
-            print(f"[INFO] 發現 {len(handles_to_draft)} 個商品需要設為草稿")
-            for handle in handles_to_draft:
-                scrape_status['current_product'] = f"設為草稿: {handle}"
-                product_id = collection_products_map.get(handle)
-                if product_id and set_product_to_draft(product_id):
-                    scrape_status['deleted'] += 1
+        for my_handle, product_info in collection_products_map.items():
+            if my_handle not in in_stock_handles:
+                scrape_status['current_product'] = f"設為草稿: {my_handle}"
+                print(f"[設為草稿] {my_handle} - 無庫存或已下架")
+                if set_product_to_draft(product_info['product_id']):
+                    scrape_status['set_to_draft'] += 1
                 time.sleep(0.5)
-        else:
-            print(f"[INFO] 沒有需要設為草稿的商品")
         
         scrape_status['current_product'] = "完成！"
         
@@ -939,7 +1078,6 @@ def test_scrape():
     """測試取得商品資料"""
     products = fetch_all_products()
     
-    # 回傳前 3 個商品的摘要
     summaries = []
     for p in products[:3]:
         summaries.append({
@@ -948,6 +1086,7 @@ def test_scrape():
             'variants_count': len(p.get('variants', [])),
             'images_count': len(p.get('images', [])),
             'options': [o.get('name') for o in p.get('options', [])],
+            'has_stock': check_product_stock(p),
             'min_price': min(float(v.get('price', 0)) for v in p.get('variants', [])) if p.get('variants') else 0
         })
     

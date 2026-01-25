@@ -27,7 +27,7 @@ CATEGORIES = {
     'work': {'url': '/shop/c/c51/', 'collection': 'WORKMAN 作業服', 'tags': ['WORKMAN', '日本', '服飾', '作業服', '工作服']},
     'mens': {'url': '/shop/c/c52/', 'collection': 'WORKMAN 男裝', 'tags': ['WORKMAN', '日本', '服飾', '男裝']},
     'womens': {'url': '/shop/c/c53/', 'collection': 'WORKMAN 女裝', 'tags': ['WORKMAN', '日本', '服飾', '女裝']},
-    'kids': {'url': '/shop/c/c54/', 'collection': 'WORKMAN 兒童服', 'tags': ['WORKMAN', '日本', '服飾', '兒童服', '童裝']}
+    'kids': {'url': '/shop/c/c54/', 'collection': 'WORKMAN 兒童', 'tags': ['WORKMAN', '日本', '服飾', '兒童', '童裝']}
 }
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -80,6 +80,99 @@ def graphql_request(query, variables=None):
     
     response = requests.post(url, headers=headers, json=payload, timeout=60)
     return response.json()
+
+
+# 快取 Collection ID
+_collection_id_cache = {}
+
+
+def get_or_create_collection(collection_name):
+    """取得或建立 Collection，回傳 Collection ID"""
+    global _collection_id_cache
+    
+    # 檢查快取
+    if collection_name in _collection_id_cache:
+        return _collection_id_cache[collection_name]
+    
+    # 先查詢是否存在
+    query = """
+    query findCollection($title: String!) {
+      collections(first: 1, query: $title) {
+        edges {
+          node {
+            id
+            title
+          }
+        }
+      }
+    }
+    """
+    result = graphql_request(query, {"title": f"title:{collection_name}"})
+    edges = result.get('data', {}).get('collections', {}).get('edges', [])
+    
+    for edge in edges:
+        if edge['node']['title'] == collection_name:
+            collection_id = edge['node']['id']
+            _collection_id_cache[collection_name] = collection_id
+            print(f"[Collection] 找到: {collection_name} -> {collection_id}")
+            return collection_id
+    
+    # 不存在，建立新的
+    mutation = """
+    mutation createCollection($input: CollectionInput!) {
+      collectionCreate(input: $input) {
+        collection {
+          id
+          title
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    result = graphql_request(mutation, {
+        "input": {
+            "title": collection_name,
+            "descriptionHtml": f"<p>{collection_name} 商品系列</p>"
+        }
+    })
+    
+    collection = result.get('data', {}).get('collectionCreate', {}).get('collection')
+    if collection:
+        collection_id = collection['id']
+        _collection_id_cache[collection_name] = collection_id
+        print(f"[Collection] 建立: {collection_name} -> {collection_id}")
+        return collection_id
+    
+    errors = result.get('data', {}).get('collectionCreate', {}).get('userErrors', [])
+    print(f"[Collection] 建立失敗: {collection_name}, 錯誤: {errors}")
+    return None
+
+
+def get_all_publication_ids():
+    """取得所有 Publication ID（用於發布商品）"""
+    query = """
+    {
+      publications(first: 20) {
+        edges {
+          node {
+            id
+            name
+          }
+        }
+      }
+    }
+    """
+    result = graphql_request(query)
+    
+    publication_ids = []
+    edges = result.get('data', {}).get('publications', {}).get('edges', [])
+    for edge in edges:
+        publication_ids.append(edge['node']['id'])
+    
+    return publication_ids
 
 
 def calculate_selling_price(cost, weight):
@@ -438,17 +531,8 @@ def parse_product_page(url):
         return None
 
 
-def product_to_jsonl_entry(product_data, tags, category_key):
+def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
     """將商品資料轉換為 JSONL 格式（Shopify GraphQL ProductSetInput）"""
-    
-    # 根據分類設定商品類型
-    PRODUCT_TYPES = {
-        'work': 'WORKMAN 作業服',
-        'mens': 'WORKMAN 男裝',
-        'womens': 'WORKMAN 女裝',
-        'kids': 'WORKMAN 兒童'
-    }
-    product_type = PRODUCT_TYPES.get(category_key, 'WORKMAN')
     
     # 翻譯
     translated = translate_with_chatgpt(
@@ -493,11 +577,29 @@ def product_to_jsonl_entry(product_data, tags, category_key):
             "values": [{"name": s} for s in sizes]
         })
     
-    # 建立 variants（ProductSetInput 格式）
-    variants = []
-    
     # 準備圖片（只取前10張）
     image_list = images[:10] if images else []
+    first_image = image_list[0] if image_list else None
+    
+    # 建立 files 陣列
+    files = []
+    if image_list:
+        for img_url in image_list:
+            files.append({
+                "originalSource": img_url,
+                "contentType": "IMAGE"
+            })
+    
+    # 建立 variant 的 file 物件（必須跟 files 陣列中的相同）
+    variant_file = None
+    if first_image:
+        variant_file = {
+            "originalSource": first_image,
+            "contentType": "IMAGE"
+        }
+    
+    # 建立 variants（ProductSetInput 格式）
+    variants = []
     
     if has_color_option and has_size_option:
         # 顏色 × 尺寸
@@ -512,6 +614,8 @@ def product_to_jsonl_entry(product_data, tags, category_key):
                         {"optionName": "尺寸", "name": size}
                     ]
                 }
+                if variant_file:
+                    variant["file"] = variant_file
                 variants.append(variant)
     elif has_color_option:
         for color in colors:
@@ -523,6 +627,8 @@ def product_to_jsonl_entry(product_data, tags, category_key):
                     {"optionName": "顏色", "name": color}
                 ]
             }
+            if variant_file:
+                variant["file"] = variant_file
             variants.append(variant)
     elif has_size_option:
         for size in sizes:
@@ -534,6 +640,8 @@ def product_to_jsonl_entry(product_data, tags, category_key):
                     {"optionName": "尺寸", "name": size}
                 ]
             }
+            if variant_file:
+                variant["file"] = variant_file
             variants.append(variant)
     else:
         # 沒有選項
@@ -542,6 +650,8 @@ def product_to_jsonl_entry(product_data, tags, category_key):
             "sku": manage_code,
             "inventoryPolicy": "CONTINUE",
         }
+        if variant_file:
+            variant["file"] = variant_file
         variants.append(variant)
     
     # 建立 SEO 描述（取說明前 160 字）
@@ -555,7 +665,6 @@ def product_to_jsonl_entry(product_data, tags, category_key):
         "title": title,
         "descriptionHtml": description,
         "vendor": "WORKMAN",
-        "productType": product_type,
         "status": "ACTIVE",
         "handle": f"workman-{manage_code}",
         "tags": tags,
@@ -575,6 +684,10 @@ def product_to_jsonl_entry(product_data, tags, category_key):
         ]
     }
     
+    # 加入 Collection（使用 ID）
+    if collection_id:
+        product_input["collections"] = [collection_id]
+    
     # 加入選項
     if product_options:
         product_input["productOptions"] = product_options
@@ -584,14 +697,8 @@ def product_to_jsonl_entry(product_data, tags, category_key):
         product_input["variants"] = variants
     
     # 加入圖片（使用 files）
-    if image_list:
-        product_input["files"] = [
-            {
-                "originalSource": img_url,
-                "contentType": "IMAGE"
-            }
-            for img_url in image_list
-        ]
+    if files:
+        product_input["files"] = files
     
     # 變數名稱是 productSet（不是 input）
     return {
@@ -1163,6 +1270,184 @@ def run_delete_workman_products():
 
 # ========== 主流程 ==========
 
+def run_test_single():
+    """測試單品：爬取一個商品並直接上傳到 Shopify"""
+    global scrape_status
+    
+    scrape_status = {
+        "running": True,
+        "phase": "testing",
+        "progress": 0,
+        "total": 1,
+        "current_product": "測試單品模式...",
+        "products": [],
+        "errors": [],
+        "jsonl_file": "",
+        "bulk_operation_id": "",
+        "bulk_status": "",
+    }
+    
+    try:
+        # 使用兒童服分類測試
+        cat_key = 'kids'
+        cat_info = CATEGORIES[cat_key]
+        tags = cat_info['tags']
+        collection_name = cat_info['collection']
+        
+        # 取得或建立 Collection
+        scrape_status['current_product'] = f"取得/建立 {collection_name}..."
+        print(f"[Test] 取得/建立 {collection_name}...")
+        collection_id = get_or_create_collection(collection_name)
+        
+        if not collection_id:
+            scrape_status['errors'].append({'error': '無法建立 Collection'})
+            scrape_status['running'] = False
+            return
+        
+        # 取得第一個商品連結
+        scrape_status['current_product'] = "取得商品連結..."
+        print("[Test] 取得第一個商品連結...")
+        product_links = fetch_all_product_links(cat_key)
+        
+        if not product_links:
+            scrape_status['errors'].append({'error': '無法取得商品連結'})
+            scrape_status['running'] = False
+            return
+        
+        # 只取第一個
+        link = product_links[0]
+        scrape_status['current_product'] = f"爬取: {link.split('/')[-2]}"
+        print(f"[Test] 爬取: {link}")
+        
+        # 解析商品
+        product_data = parse_product_page(link)
+        
+        if not product_data:
+            scrape_status['errors'].append({'error': '解析商品失敗'})
+            scrape_status['running'] = False
+            return
+        
+        # 翻譯並建立資料
+        scrape_status['current_product'] = f"翻譯: {product_data['title'][:20]}..."
+        print(f"[Test] 翻譯: {product_data['title'][:30]}...")
+        entry = product_to_jsonl_entry(product_data, tags, cat_key, collection_id)
+        
+        product_input = entry['productSet']
+        
+        scrape_status['products'].append({
+            'title': product_input['title'],
+            'handle': product_input['handle'],
+            'variants': len(product_input.get('variants', []))
+        })
+        
+        # 直接用 productSet mutation 上傳（不用 bulk operation）
+        scrape_status['current_product'] = "上傳到 Shopify..."
+        print("[Test] 直接上傳到 Shopify...")
+        
+        mutation = """
+        mutation productSet($input: ProductSetInput!, $synchronous: Boolean!) {
+          productSet(synchronous: $synchronous, input: $input) {
+            product {
+              id
+              title
+              handle
+              status
+              productType
+              onlineStoreUrl
+              metafields(first: 5) {
+                edges {
+                  node {
+                    namespace
+                    key
+                    value
+                  }
+                }
+              }
+              seo {
+                title
+                description
+              }
+              variants(first: 10) {
+                edges {
+                  node {
+                    id
+                    sku
+                    price
+                  }
+                }
+              }
+            }
+            userErrors {
+              field
+              code
+              message
+            }
+          }
+        }
+        """
+        
+        load_shopify_token()
+        result = graphql_request(mutation, {
+            "input": product_input,
+            "synchronous": True
+        })
+        
+        # 檢查結果
+        product_set = result.get('data', {}).get('productSet', {})
+        user_errors = product_set.get('userErrors', [])
+        
+        if user_errors:
+            error_msg = '; '.join([e.get('message', str(e)) for e in user_errors])
+            scrape_status['errors'].append({'error': f'上傳失敗: {error_msg}'})
+            scrape_status['current_product'] = f"❌ 上傳失敗: {error_msg}"
+            print(f"[Test] ❌ 上傳失敗: {user_errors}")
+        else:
+            product = product_set.get('product', {})
+            product_id = product.get('id', '')
+            product_title = product.get('title', '')
+            product_handle = product.get('handle', '')
+            
+            # 發布到所有銷售管道
+            scrape_status['current_product'] = "發布到銷售管道..."
+            print("[Test] 發布到銷售管道...")
+            publish_result = publish_product_to_all_channels(product_id)
+            
+            if publish_result.get('success'):
+                scrape_status['current_product'] = f"✅ 測試成功！商品: {product_title}"
+                print(f"[Test] ✅ 成功！ID: {product_id}")
+                print(f"[Test] 標題: {product_title}")
+                print(f"[Test] Handle: {product_handle}")
+                print(f"[Test] 類型: {product.get('productType', '')}")
+                print(f"[Test] SEO: {product.get('seo', {})}")
+                print(f"[Test] 發布到 {publish_result.get('publications', 0)} 個銷售管道")
+                
+                # 記錄詳細結果
+                scrape_status['test_result'] = {
+                    'id': product_id,
+                    'title': product_title,
+                    'handle': product_handle,
+                    'productType': product.get('productType', ''),
+                    'seo': product.get('seo', {}),
+                    'metafields': product.get('metafields', {}),
+                    'variants': product.get('variants', {}),
+                    'published': publish_result.get('publications', 0)
+                }
+            else:
+                scrape_status['current_product'] = f"⚠️ 商品已建立但發布失敗"
+                scrape_status['errors'].append({'error': f'發布失敗: {publish_result}'})
+        
+        scrape_status['progress'] = 1
+        
+    except Exception as e:
+        scrape_status['errors'].append({'error': str(e)})
+        scrape_status['current_product'] = f"❌ 錯誤: {str(e)}"
+        print(f"[Test] ❌ 錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        scrape_status['running'] = False
+
+
 def run_scrape(category):
     """執行爬取，產生 JSONL 檔案"""
     global scrape_status
@@ -1196,16 +1481,28 @@ def run_scrape(category):
         for cat_key in categories_to_scrape:
             cat_info = CATEGORIES[cat_key]
             tags = cat_info['tags']
+            collection_name = cat_info['collection']
             
-            scrape_status['current_product'] = f"正在取得 {cat_info['collection']} 商品連結..."
-            print(f"[DEBUG] 開始取得 {cat_info['collection']} 商品連結...")
+            # 取得或建立 Collection
+            scrape_status['current_product'] = f"正在取得/建立 {collection_name} 商品系列..."
+            print(f"[Collection] 取得/建立 {collection_name}...")
+            collection_id = get_or_create_collection(collection_name)
+            
+            if not collection_id:
+                error_msg = f"無法取得/建立 {collection_name} 商品系列"
+                print(f"[ERROR] {error_msg}")
+                scrape_status['errors'].append({'error': error_msg})
+                continue
+            
+            scrape_status['current_product'] = f"正在取得 {collection_name} 商品連結..."
+            print(f"[DEBUG] 開始取得 {collection_name} 商品連結...")
             
             product_links = fetch_all_product_links(cat_key)
             
             print(f"[DEBUG] 取得 {len(product_links)} 個商品連結")
             
             if not product_links:
-                error_msg = f"{cat_info['collection']} 取得 0 個商品連結，可能是網路問題或網站結構變更"
+                error_msg = f"{collection_name} 取得 0 個商品連結，可能是網路問題或網站結構變更"
                 print(f"[ERROR] {error_msg}")
                 scrape_status['errors'].append({'error': error_msg})
                 scrape_status['current_product'] = error_msg
@@ -1226,7 +1523,7 @@ def run_scrape(category):
                 
                 try:
                     print(f"[翻譯] {product_data['title'][:30]}...")
-                    entry = product_to_jsonl_entry(product_data, tags, cat_key)
+                    entry = product_to_jsonl_entry(product_data, tags, cat_key, collection_id)
                     all_jsonl_entries.append(entry)
                     
                     scrape_status['products'].append({
@@ -1380,6 +1677,14 @@ def index():
         <button class="btn btn-check" onclick="testConnection()">🔗 測試連線 workman.jp</button>
         <button class="btn btn-check" onclick="testProductParse()">🔍 測試商品頁面解析</button>
         <button class="btn btn-check" onclick="testShopify()">🔗 測試連線 Shopify</button>
+    </div>
+    
+    <div class="card" style="border: 2px solid #28a745; background: #f0fff4;">
+        <h3>🧪 測試單品（快速驗證）</h3>
+        <p>只爬取<strong>一個商品</strong>並直接上傳到 Shopify，用於快速測試格式是否正確。</p>
+        <button class="btn" style="background:#28a745;color:white;" onclick="testSingle()">🧪 測試單品上傳</button>
+        <button class="btn btn-check" onclick="checkTestResult()">📋 查看測試結果</button>
+        <div id="testResult" style="margin-top:10px;padding:10px;background:#fff;border-radius:5px;display:none;"></div>
     </div>
     
     <div class="card">
@@ -1678,6 +1983,80 @@ def index():
                 });
         }
         
+        function testSingle() {
+            if (!confirm('將爬取一個兒童服商品並直接上傳到 Shopify，確定要測試？')) return;
+            
+            log('🧪 開始測試單品上傳...');
+            document.getElementById('status').textContent = '測試單品模式...';
+            document.getElementById('testResult').style.display = 'none';
+            
+            fetch('/api/test_single')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        log('❌ ' + data.error);
+                    } else {
+                        log('🧪 測試已開始，請等待...');
+                        pollTestStatus();
+                    }
+                })
+                .catch(err => {
+                    log('❌ 測試啟動失敗: ' + err);
+                });
+        }
+        
+        function pollTestStatus() {
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('status').textContent = data.current_product || '處理中...';
+                    
+                    if (data.running) {
+                        setTimeout(pollTestStatus, 1000);
+                    } else {
+                        // 測試完成，顯示結果
+                        checkTestResult();
+                    }
+                });
+        }
+        
+        function checkTestResult() {
+            log('📋 查詢測試結果...');
+            fetch('/api/test_result')
+                .then(r => r.json())
+                .then(data => {
+                    const resultDiv = document.getElementById('testResult');
+                    resultDiv.style.display = 'block';
+                    
+                    if (data.errors && data.errors.length > 0) {
+                        resultDiv.innerHTML = '<strong style="color:red;">❌ 測試失敗:</strong><br>' + 
+                            data.errors.map(e => e.error || JSON.stringify(e)).join('<br>');
+                        log('❌ 測試失敗: ' + JSON.stringify(data.errors));
+                    } else if (data.test_result && data.test_result.id) {
+                        const r = data.test_result;
+                        resultDiv.innerHTML = `
+                            <strong style="color:green;">✅ 測試成功！</strong><br>
+                            <table style="width:100%;border-collapse:collapse;margin-top:10px;">
+                                <tr><td style="padding:5px;border:1px solid #ddd;"><strong>ID</strong></td><td style="padding:5px;border:1px solid #ddd;">${r.id}</td></tr>
+                                <tr><td style="padding:5px;border:1px solid #ddd;"><strong>標題</strong></td><td style="padding:5px;border:1px solid #ddd;">${r.title}</td></tr>
+                                <tr><td style="padding:5px;border:1px solid #ddd;"><strong>Handle</strong></td><td style="padding:5px;border:1px solid #ddd;">${r.handle}</td></tr>
+                                <tr><td style="padding:5px;border:1px solid #ddd;"><strong>商品類型</strong></td><td style="padding:5px;border:1px solid #ddd;">${r.productType || '(空)'}</td></tr>
+                                <tr><td style="padding:5px;border:1px solid #ddd;"><strong>SEO 標題</strong></td><td style="padding:5px;border:1px solid #ddd;">${r.seo?.title || '(空)'}</td></tr>
+                                <tr><td style="padding:5px;border:1px solid #ddd;"><strong>SEO 描述</strong></td><td style="padding:5px;border:1px solid #ddd;">${(r.seo?.description || '(空)').substring(0, 50)}...</td></tr>
+                                <tr><td style="padding:5px;border:1px solid #ddd;"><strong>銷售管道</strong></td><td style="padding:5px;border:1px solid #ddd;">${r.published} 個</td></tr>
+                            </table>
+                            <p style="margin-top:10px;">👉 <a href="https://admin.shopify.com/store/goyoulink/products" target="_blank">前往 Shopify 後台查看</a></p>
+                        `;
+                        log('✅ 測試成功！商品: ' + r.title);
+                    } else {
+                        resultDiv.innerHTML = '<strong>⏳ 尚無測試結果</strong><br>狀態: ' + (data.current_product || '等待中');
+                    }
+                })
+                .catch(err => {
+                    log('❌ 查詢失敗: ' + err);
+                });
+        }
+        
         function resetTracking() {
             lastProductCount = 0;
             lastProgress = 0;
@@ -1804,6 +2183,30 @@ def api_start():
     thread.start()
     
     return jsonify({'started': True, 'category': category})
+
+
+@app.route('/api/test_single')
+def api_test_single():
+    """測試單品：爬取一個商品並直接上傳"""
+    if scrape_status['running']:
+        return jsonify({'error': '正在執行中'})
+    
+    thread = threading.Thread(target=run_test_single)
+    thread.start()
+    
+    return jsonify({'started': True, 'mode': 'test_single'})
+
+
+@app.route('/api/test_result')
+def api_test_result():
+    """取得測試單品的詳細結果"""
+    return jsonify({
+        'running': scrape_status.get('running', False),
+        'phase': scrape_status.get('phase', ''),
+        'current_product': scrape_status.get('current_product', ''),
+        'errors': scrape_status.get('errors', []),
+        'test_result': scrape_status.get('test_result', {})
+    })
 
 
 @app.route('/api/upload')

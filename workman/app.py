@@ -438,8 +438,17 @@ def parse_product_page(url):
         return None
 
 
-def product_to_jsonl_entry(product_data, tags):
+def product_to_jsonl_entry(product_data, tags, category_key):
     """將商品資料轉換為 JSONL 格式（Shopify GraphQL ProductSetInput）"""
+    
+    # 根據分類設定商品類型
+    PRODUCT_TYPES = {
+        'work': 'WORKMAN 作業服',
+        'mens': 'WORKMAN 男裝',
+        'womens': 'WORKMAN 女裝',
+        'kids': 'WORKMAN 兒童'
+    }
+    product_type = PRODUCT_TYPES.get(category_key, 'WORKMAN')
     
     # 翻譯
     translated = translate_with_chatgpt(
@@ -450,11 +459,20 @@ def product_to_jsonl_entry(product_data, tags):
     
     title = translated['title']
     description = translated['description']
+    
+    # 移除說明文中的超連結（包含 <a> 標籤和其中的文字）
+    import re
+    description = re.sub(r'<a[^>]*>.*?</a>', '', description)
+    # 也移除可能殘留的空行
+    description = re.sub(r'<p>\s*</p>', '', description)
+    description = re.sub(r'<br\s*/?>\s*<br\s*/?>', '<br>', description)
+    
     manage_code = product_data['manage_code']
     cost = product_data['price']
     colors = product_data['colors']
     sizes = product_data['sizes']
     images = product_data['images']
+    source_url = product_data['url']
     
     selling_price = calculate_selling_price(cost, DEFAULT_WEIGHT)
     
@@ -477,6 +495,9 @@ def product_to_jsonl_entry(product_data, tags):
     
     # 建立 variants（ProductSetInput 格式）
     variants = []
+    
+    # 準備圖片（只取前10張）
+    image_list = images[:10] if images else []
     
     if has_color_option and has_size_option:
         # 顏色 × 尺寸
@@ -516,21 +537,42 @@ def product_to_jsonl_entry(product_data, tags):
             variants.append(variant)
     else:
         # 沒有選項
-        variants.append({
+        variant = {
             "price": selling_price,
             "sku": manage_code,
             "inventoryPolicy": "CONTINUE",
-        })
+        }
+        variants.append(variant)
+    
+    # 建立 SEO 描述（取說明前 160 字）
+    import html
+    seo_description = re.sub(r'<[^>]+>', '', description)  # 移除 HTML 標籤
+    seo_description = html.unescape(seo_description)  # 解碼 HTML entities
+    seo_description = seo_description[:160].strip()
     
     # ProductSetInput 結構
     product_input = {
         "title": title,
         "descriptionHtml": description,
         "vendor": "WORKMAN",
-        "productType": "",
+        "productType": product_type,
         "status": "ACTIVE",
         "handle": f"workman-{manage_code}",
         "tags": tags,
+        # SEO 資訊
+        "seo": {
+            "title": title,
+            "description": seo_description
+        },
+        # 中繼欄位 - 來源連結
+        "metafields": [
+            {
+                "namespace": "custom",
+                "key": "link",
+                "value": source_url,
+                "type": "url"
+            }
+        ]
     }
     
     # 加入選項
@@ -542,16 +584,16 @@ def product_to_jsonl_entry(product_data, tags):
         product_input["variants"] = variants
     
     # 加入圖片（使用 files）
-    if images:
+    if image_list:
         product_input["files"] = [
             {
                 "originalSource": img_url,
                 "contentType": "IMAGE"
             }
-            for img_url in images[:10]
+            for img_url in image_list
         ]
     
-    # 加入 synchronous 參數，變數名稱是 productSet（不是 input）
+    # 變數名稱是 productSet（不是 input）
     return {
         "productSet": product_input,
         "synchronous": True
@@ -728,8 +770,23 @@ def get_bulk_operation_results():
                     try:
                         data = json.loads(line)
                         
-                        # 檢查 userErrors
-                        if 'data' in data and 'productCreate' in data.get('data', {}):
+                        # 檢查 productSet 結果
+                        if 'data' in data and 'productSet' in data.get('data', {}):
+                            product_set = data['data']['productSet']
+                            user_errors = product_set.get('userErrors', [])
+                            
+                            if user_errors:
+                                errors.append({
+                                    'errors': user_errors,
+                                    'input': data.get('__parentId', '')
+                                })
+                            elif product_set.get('product'):
+                                successes.append({
+                                    'id': product_set['product'].get('id'),
+                                    'title': product_set['product'].get('title', '')[:50]
+                                })
+                        # 相容舊的 productCreate 格式
+                        elif 'data' in data and 'productCreate' in data.get('data', {}):
                             product_create = data['data']['productCreate']
                             user_errors = product_create.get('userErrors', [])
                             
@@ -743,6 +800,12 @@ def get_bulk_operation_results():
                                     'id': product_create['product'].get('id'),
                                     'title': product_create['product'].get('title', '')[:50]
                                 })
+                        # 檢查是否有錯誤
+                        elif 'errors' in data:
+                            errors.append({
+                                'errors': data['errors'],
+                                'input': ''
+                            })
                         
                         results['sample_results'].append(data)
                     except:
@@ -754,6 +817,123 @@ def get_bulk_operation_results():
                 results['success_count'] = len(successes)
         except Exception as e:
             results['fetch_error'] = str(e)
+    
+    return results
+
+
+# ========== 批量發布到銷售管道 ==========
+
+def get_all_publications():
+    """取得所有銷售管道（Publications）"""
+    query = """
+    {
+      publications(first: 20) {
+        edges {
+          node {
+            id
+            name
+            catalog {
+              title
+            }
+          }
+        }
+      }
+    }
+    """
+    result = graphql_request(query)
+    
+    publications = []
+    edges = result.get('data', {}).get('publications', {}).get('edges', [])
+    for edge in edges:
+        node = edge.get('node', {})
+        publications.append({
+            'id': node.get('id'),
+            'name': node.get('name') or node.get('catalog', {}).get('title', 'Unknown')
+        })
+    
+    return publications
+
+
+def publish_product_to_all_channels(product_id):
+    """發布商品到所有銷售管道"""
+    publications = get_all_publications()
+    
+    if not publications:
+        return {'success': False, 'error': 'No publications found'}
+    
+    # 建立 input 陣列
+    publication_inputs = [{"publicationId": pub['id']} for pub in publications]
+    
+    mutation = """
+    mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+      publishablePublish(id: $id, input: $input) {
+        publishable {
+          availablePublicationsCount {
+            count
+          }
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    
+    result = graphql_request(mutation, {"id": product_id, "input": publication_inputs})
+    
+    user_errors = result.get('data', {}).get('publishablePublish', {}).get('userErrors', [])
+    if user_errors:
+        return {'success': False, 'errors': user_errors}
+    
+    return {'success': True, 'publications': len(publications)}
+
+
+def batch_publish_workman_products():
+    """批量發布所有 WORKMAN 商品到所有銷售管道"""
+    # 取得所有 WORKMAN 商品
+    product_ids = fetch_workman_product_ids()
+    
+    if not product_ids:
+        return {'success': False, 'error': 'No WORKMAN products found'}
+    
+    # 取得所有銷售管道
+    publications = get_all_publications()
+    
+    if not publications:
+        return {'success': False, 'error': 'No publications found'}
+    
+    publication_inputs = [{"publicationId": pub['id']} for pub in publications]
+    
+    results = {
+        'total': len(product_ids),
+        'success': 0,
+        'failed': 0,
+        'errors': []
+    }
+    
+    for product_id in product_ids:
+        mutation = """
+        mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+          publishablePublish(id: $id, input: $input) {
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        
+        result = graphql_request(mutation, {"id": product_id, "input": publication_inputs})
+        
+        user_errors = result.get('data', {}).get('publishablePublish', {}).get('userErrors', [])
+        if user_errors:
+            results['failed'] += 1
+            results['errors'].append({'id': product_id, 'errors': user_errors})
+        else:
+            results['success'] += 1
+        
+        time.sleep(0.1)  # 避免 rate limit
     
     return results
 
@@ -1046,15 +1226,15 @@ def run_scrape(category):
                 
                 try:
                     print(f"[翻譯] {product_data['title'][:30]}...")
-                    entry = product_to_jsonl_entry(product_data, tags)
+                    entry = product_to_jsonl_entry(product_data, tags, cat_key)
                     all_jsonl_entries.append(entry)
                     
                     scrape_status['products'].append({
-                        'title': entry['input']['title'],
-                        'handle': entry['input']['handle'],
-                        'variants': len(entry['input'].get('variants', []))
+                        'title': entry['productSet']['title'],
+                        'handle': entry['productSet']['handle'],
+                        'variants': len(entry['productSet'].get('variants', []))
                     })
-                    print(f"[OK] {entry['input']['title'][:30]}")
+                    print(f"[OK] {entry['productSet']['title'][:30]}")
                 except Exception as e:
                     print(f"[ERROR] {product_data['title'][:20]}: {e}")
                     scrape_status['errors'].append({'url': link, 'error': str(e)})
@@ -1230,6 +1410,13 @@ def index():
     </div>
     
     <div class="card">
+        <h3>📢 發布到銷售管道</h3>
+        <p>商品建立後，需要發布到銷售管道才會在商店顯示。</p>
+        <button class="btn btn-upload" onclick="publishAll()">📢 發布所有 WORKMAN 商品</button>
+        <button class="btn btn-check" onclick="getPublications()">📋 查看銷售管道</button>
+    </div>
+    
+    <div class="card">
         <h3>📊 執行狀態</h3>
         <div id="status">等待開始...</div>
         <div class="progress"><div class="progress-bar" id="progressBar" style="width:0%"></div></div>
@@ -1360,6 +1547,46 @@ def index():
                         log('❌ 錯誤: ' + data.error);
                     } else {
                         log(`📊 目前有 ${data.count} 個 WORKMAN 商品`);
+                    }
+                });
+        }
+        
+        function publishAll() {
+            if (!confirm('確定要發布所有 WORKMAN 商品到所有銷售管道？')) return;
+            
+            log('📢 正在發布商品到所有銷售管道...');
+            document.getElementById('status').textContent = '正在發布商品...';
+            
+            fetch('/api/publish_all')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        log('❌ 錯誤: ' + data.error);
+                    } else {
+                        log(`📢 發布完成！成功: ${data.success}, 失敗: ${data.failed}`);
+                        if (data.errors && data.errors.length > 0) {
+                            log('錯誤詳情: ' + JSON.stringify(data.errors.slice(0, 3)));
+                        }
+                    }
+                    document.getElementById('status').textContent = '發布完成';
+                })
+                .catch(err => {
+                    log('❌ 發布失敗: ' + err);
+                });
+        }
+        
+        function getPublications() {
+            log('📋 正在查詢銷售管道...');
+            fetch('/api/publications')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        log('❌ 錯誤: ' + data.error);
+                    } else if (data.publications) {
+                        log(`📋 找到 ${data.publications.length} 個銷售管道:`);
+                        data.publications.forEach(pub => {
+                            log(`   - ${pub.name} (${pub.id})`);
+                        });
                     }
                 });
         }
@@ -1628,6 +1855,29 @@ def api_delete():
     thread.start()
     
     return jsonify({'started': True})
+
+
+@app.route('/api/publish_all')
+def api_publish_all():
+    """批量發布所有 WORKMAN 商品到所有銷售管道"""
+    if scrape_status['running']:
+        return jsonify({'error': '正在執行中'})
+    
+    try:
+        results = batch_publish_workman_products()
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/publications')
+def api_publications():
+    """取得所有銷售管道"""
+    try:
+        publications = get_all_publications()
+        return jsonify({'publications': publications})
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 
 @app.route('/api/count')

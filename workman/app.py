@@ -617,78 +617,84 @@ def parse_product_page(url):
         images = []
         color_images = {}  # {顏色索引: 圖片URL}
         
-        # 找到圖片 gallery 區塊
+        # 先從 slider 取得大圖（這裡有正確的路徑）
+        slider = soup.find('div', class_='js-goods-detail-goods-slider')
+        if slider:
+            slider_imgs = slider.find_all('img', class_='js-zoom')
+            seen_urls = set()
+            for img in slider_imgs:
+                img_src = img.get('src', '')
+                if img_src and img_src not in seen_urls:
+                    seen_urls.add(img_src)
+                    full_url = SOURCE_URL + img_src
+                    
+                    # 主圖 (_t1) 放最前面
+                    if '_t1.' in img_src:
+                        images.insert(0, full_url)
+                    elif '_c' in img_src or '_d' in img_src:
+                        images.append(full_url)
+        
+        # 從 gallery 取得顏色名稱和對應圖片
         gallery = soup.find('ul', class_='js-goods-detail-gallery-slider')
         if gallery:
             gallery_items = gallery.find_all('li', class_='block-goods-gallery--color-variation-src')
             
             for item in gallery_items:
-                full_url = None
-                
-                # 取得圖片連結
-                img_link = item.find('a')
-                if img_link:
-                    img_href = img_link.get('href', '')
-                    img_tag = item.find('img')
-                    img_alt = img_tag.get('alt', '') if img_tag else ''
-                    
-                    # 轉換為大圖 URL
-                    if img_href:
-                        # /img/goods/1/31119_c1.jpg -> /img/goods/L/31119_c1.jpg
-                        large_url = re.sub(r'/img/goods/\d+/', '/img/goods/L/', img_href)
-                        # /img/goods/S/31119_t1.jpg -> /img/goods/L/31119_t1.jpg
-                        large_url = re.sub(r'/img/goods/S/', '/img/goods/L/', large_url)
-                        full_url = SOURCE_URL + large_url
-                        
-                        # 主圖 (_t1) 放最前面
-                        if '_t1.' in large_url:
-                            images.insert(0, full_url)
-                        else:
-                            images.append(full_url)
-                
                 # 取得顏色名稱（從 p 標籤）
                 color_name_elem = item.find('p', class_='block-goods-detail--color-variation-goods-color-name')
                 if color_name_elem:
                     color_name = color_name_elem.get_text(strip=True)
                     if color_name and color_name not in colors:
                         colors.append(color_name)
-                        # 記錄顏色對應的圖片
-                        if full_url:
-                            color_idx = len(colors) - 1
-                            color_images[color_idx] = full_url
+                        
+                        # 找這個顏色對應的圖片
+                        img_tag = item.find('img')
+                        if img_tag:
+                            img_alt = img_tag.get('alt', '')
+                            # 在已收集的 images 中找匹配的
+                            for img_url in images:
+                                if '_c' in img_url and img_alt in img_url.replace('%20', ' '):
+                                    color_images[len(colors) - 1] = img_url
+                                    break
+                            else:
+                                # 如果沒找到，用 href（但要找對應的 slider 大圖）
+                                img_link = item.find('a')
+                                if img_link:
+                                    img_href = img_link.get('href', '')
+                                    # 從 href 提取檔名，在 images 中找對應的大圖
+                                    if img_href:
+                                        filename = img_href.split('/')[-1]  # e.g., 31119_c1.jpg
+                                        for img_url in images:
+                                            if filename in img_url:
+                                                color_images[len(colors) - 1] = img_url
+                                                break
         
-        # 如果 gallery 沒找到，嘗試從 slider 區塊取得圖片
+        # 如果 slider 沒圖片，嘗試從 gallery 的 href 取得
         if not images:
-            slider = soup.find('div', class_='js-goods-detail-goods-slider')
-            if slider:
-                slider_imgs = slider.find_all('img', class_='js-zoom')
-                seen_urls = set()
-                for img in slider_imgs:
-                    img_src = img.get('src', '')
-                    if img_src and img_src not in seen_urls:
-                        seen_urls.add(img_src)
-                        # 轉換為大圖
-                        large_url = re.sub(r'/img/goods/\d+/', '/img/goods/L/', img_src)
-                        full_url = SOURCE_URL + large_url
-                        
-                        if '_t1.' in large_url:
-                            images.insert(0, full_url)
-                        elif '_c' in large_url or '_d' in large_url:
-                            images.append(full_url)
-                        
-                        # 從 alt 取得顏色
-                        img_alt = img.get('alt', '')
-                        if img_alt and '_c' in img_src and img_alt not in colors:
-                            colors.append(img_alt)
-                            color_images[len(colors) - 1] = full_url
+            gallery = soup.find('ul', class_='js-goods-detail-gallery-slider')
+            if gallery:
+                for item in gallery.find_all('li'):
+                    img_link = item.find('a')
+                    if img_link:
+                        img_href = img_link.get('href', '')
+                        if img_href:
+                            # 保持原始路徑，不轉換
+                            full_url = SOURCE_URL + img_href
+                            if '_t1.' in img_href:
+                                images.insert(0, full_url)
+                            elif full_url not in images:
+                                images.append(full_url)
         
-        # 如果還是沒有顏色，從其他地方嘗試
+        # 如果還是沒有顏色，從 slider 圖片 alt 取得
         if not colors:
-            # 嘗試從圖片 alt 取得
-            for img in soup.find_all('img', src=re.compile(r'/img/goods/.*_c\d+\.jpg')):
-                alt = img.get('alt', '')
-                if alt and alt not in colors:
-                    colors.append(alt)
+            if slider:
+                for img in slider.find_all('img', class_='js-zoom'):
+                    alt = img.get('alt', '')
+                    img_src = img.get('src', '')
+                    if alt and '_c' in img_src and alt not in colors:
+                        colors.append(alt)
+                        full_url = SOURCE_URL + img_src
+                        color_images[len(colors) - 1] = full_url
         
         if not colors:
             colors = ['標準']
@@ -716,16 +722,15 @@ def parse_product_page(url):
         # 去重圖片
         images = list(dict.fromkeys(images))
         
-        # 如果沒找到圖片，用管理番號組合
+        # 如果沒找到圖片，用管理番號組合（fallback）
         if not images and manage_code:
             images.append(f"{SOURCE_URL}/img/goods/L/{manage_code}_t1.jpg")
-            for i in range(1, min(len(colors) + 1, 10)):
-                color_img = f"{SOURCE_URL}/img/goods/L/{manage_code}_c{i}.jpg"
-                images.append(color_img)
-                if i - 1 < len(colors):
-                    color_images[i - 1] = color_img
         
         print(f"[解析] {title[:20]} - 顏色: {colors}, 尺寸: {sizes}, 圖片: {len(images)} 張")
+        if images:
+            print(f"[解析] 圖片列表: {[url.split('/')[-1] for url in images[:5]]}")
+        if color_images:
+            print(f"[解析] 顏色圖片對應: {[(k, v.split('/')[-1]) for k, v in color_images.items()]}")
         
         return {
             'url': url,

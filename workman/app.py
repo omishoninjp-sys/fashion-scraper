@@ -283,24 +283,39 @@ def parse_product_page(url):
     try:
         response = requests.get(url, headers=HEADERS, timeout=30)
         if response.status_code != 200:
+            print(f"[解析失敗] {url} - HTTP {response.status_code}")
             return None
         
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 標題
+        # 標題 - 嘗試多種方式
+        title = ''
         title_elem = soup.find('h1', class_='block-goods-name')
-        title = title_elem.get_text(strip=True) if title_elem else ''
+        if title_elem:
+            title = title_elem.get_text(strip=True)
+        else:
+            # 備用：找任何 h1
+            title_elem = soup.find('h1')
+            if title_elem:
+                title = title_elem.get_text(strip=True)
         
-        # 價格
+        print(f"[解析] 標題: {title[:30] if title else '(無)'}")
+        
+        # 價格 - 嘗試多種方式
         price = 0
         price_elem = soup.find('p', class_='block-goods-price')
+        if not price_elem:
+            # 備用：找 class 包含 price 的元素
+            price_elem = soup.find(class_=re.compile(r'price'))
         if price_elem:
             price_text = price_elem.get_text(strip=True)
             match = re.search(r'[\d,]+', price_text)
             if match:
                 price = int(match.group().replace(',', ''))
         
-        # 管理番號
+        print(f"[解析] 價格: ¥{price}")
+        
+        # 管理番號 - 嘗試多種方式
         manage_code = ''
         code_dt = soup.find('dt', string='管理番号')
         if code_dt:
@@ -308,8 +323,23 @@ def parse_product_page(url):
             if code_dd:
                 manage_code = code_dd.get_text(strip=True)
         
-        if not manage_code or price < 1000:
+        if not manage_code:
+            # 備用：從 URL 取得
+            match = re.search(r'/g/g(\d+)/', url)
+            if match:
+                manage_code = match.group(1)
+        
+        print(f"[解析] 管理番號: {manage_code if manage_code else '(無)'}")
+        
+        # 放寬條件：只要有 manage_code 就繼續（不再要求 price >= 1000）
+        if not manage_code:
+            print(f"[解析失敗] {url} - 無法取得管理番號")
             return None
+        
+        # 如果價格為 0，設定預設值
+        if price == 0:
+            price = 1500  # 預設價格
+            print(f"[解析] 價格為 0，使用預設值 ¥{price}")
         
         # 商品說明
         description = ''
@@ -1101,6 +1131,7 @@ def index():
         <h3>🔗 連線測試</h3>
         <p>爬取前先測試是否能連接到 workman.jp</p>
         <button class="btn btn-check" onclick="testConnection()">🔗 測試連線 workman.jp</button>
+        <button class="btn btn-check" onclick="testProductParse()">🔍 測試商品頁面解析</button>
         <button class="btn btn-check" onclick="testShopify()">🔗 測試連線 Shopify</button>
     </div>
     
@@ -1240,6 +1271,50 @@ def index():
                         }
                     } else {
                         log('❌ 兒童服分類頁連線失敗: ' + JSON.stringify(data.kids_page));
+                    }
+                })
+                .catch(err => {
+                    log('❌ 測試失敗: ' + err);
+                });
+        }
+        
+        function testProductParse() {
+            log('🔍 測試商品頁面解析...');
+            fetch('/api/test_product')
+                .then(r => r.json())
+                .then(data => {
+                    log('📄 測試 URL: ' + data.url);
+                    log('   HTTP 狀態: ' + data.status);
+                    
+                    if (data.title_found) {
+                        log('   ✅ 標題: ' + data.title);
+                    } else {
+                        log('   ❌ 找不到標題 (block-goods-name)');
+                        if (data.h1_found) {
+                            log('   📝 備用 h1: ' + data.h1_text);
+                        }
+                    }
+                    
+                    if (data.price_elem_found) {
+                        log('   ✅ 價格: ' + data.price_text);
+                    } else {
+                        log('   ❌ 找不到價格 (block-goods-price)');
+                        if (data.price_any_found) {
+                            log('   📝 備用價格: ' + data.price_any_text);
+                        }
+                    }
+                    
+                    if (data.manage_code_dt_found) {
+                        log('   ✅ 管理番號: ' + data.manage_code);
+                    } else {
+                        log('   ❌ 找不到管理番號 (dt 管理番号)');
+                        if (data.manage_code_from_url) {
+                            log('   📝 從 URL 取得: ' + data.manage_code_from_url);
+                        }
+                    }
+                    
+                    if (data.relevant_classes && data.relevant_classes.length > 0) {
+                        log('   📋 相關 class: ' + data.relevant_classes.slice(0, 10).join(', '));
                     }
                 })
                 .catch(err => {
@@ -1496,6 +1571,78 @@ def api_test_workman():
                 results['kids_page']['sample_links'] = [l.get('href', '') for l in goods_links[:5]]
     except Exception as e:
         results['kids_page'] = {'error': str(e), 'ok': False}
+    
+    return jsonify(results)
+
+
+@app.route('/api/test_product')
+def api_test_product():
+    """測試解析單一商品頁面"""
+    from flask import request
+    product_url = request.args.get('url', '')
+    
+    if not product_url:
+        # 預設測試第一個兒童商品
+        product_url = SOURCE_URL + '/shop/g/g2300022383210/'
+    elif not product_url.startswith('http'):
+        product_url = SOURCE_URL + product_url
+    
+    results = {'url': product_url}
+    
+    try:
+        response = requests.get(product_url, headers=HEADERS, timeout=15)
+        results['status'] = response.status_code
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 標題
+            title_elem = soup.find('h1', class_='block-goods-name')
+            results['title_found'] = title_elem is not None
+            if title_elem:
+                results['title'] = title_elem.get_text(strip=True)[:50]
+            else:
+                # 嘗試其他方式
+                h1 = soup.find('h1')
+                results['h1_found'] = h1 is not None
+                if h1:
+                    results['h1_text'] = h1.get_text(strip=True)[:50]
+            
+            # 價格
+            price_elem = soup.find('p', class_='block-goods-price')
+            results['price_elem_found'] = price_elem is not None
+            if price_elem:
+                results['price_text'] = price_elem.get_text(strip=True)
+            else:
+                # 嘗試其他方式
+                price_any = soup.find(class_=re.compile(r'price'))
+                results['price_any_found'] = price_any is not None
+                if price_any:
+                    results['price_any_text'] = price_any.get_text(strip=True)[:50]
+            
+            # 管理番號
+            code_dt = soup.find('dt', string='管理番号')
+            results['manage_code_dt_found'] = code_dt is not None
+            if code_dt:
+                code_dd = code_dt.find_next_sibling('dd')
+                if code_dd:
+                    results['manage_code'] = code_dd.get_text(strip=True)
+            
+            # 從 URL 取得備用
+            match = re.search(r'/g/g(\d+)/', product_url)
+            if match:
+                results['manage_code_from_url'] = match.group(1)
+            
+            # 列出頁面上的一些 class
+            all_classes = set()
+            for tag in soup.find_all(class_=True):
+                for c in tag.get('class', []):
+                    if 'goods' in c.lower() or 'price' in c.lower() or 'product' in c.lower():
+                        all_classes.add(c)
+            results['relevant_classes'] = list(all_classes)[:20]
+            
+    except Exception as e:
+        results['error'] = str(e)
     
     return jsonify(results)
 

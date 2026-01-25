@@ -144,11 +144,51 @@ def get_or_create_collection(collection_name):
         collection_id = collection['id']
         _collection_id_cache[collection_name] = collection_id
         print(f"[Collection] 建立: {collection_name} -> {collection_id}")
+        
+        # 發布 Collection 到所有銷售管道
+        publish_collection_to_all_channels(collection_id)
+        
         return collection_id
     
     errors = result.get('data', {}).get('collectionCreate', {}).get('userErrors', [])
     print(f"[Collection] 建立失敗: {collection_name}, 錯誤: {errors}")
     return None
+
+
+def publish_collection_to_all_channels(collection_id):
+    """發布 Collection 到所有銷售管道"""
+    publication_ids = get_all_publication_ids()
+    
+    if not publication_ids:
+        print(f"[Collection] 沒有找到任何銷售管道")
+        return
+    
+    publication_inputs = [{"publicationId": pub_id} for pub_id in publication_ids]
+    
+    mutation = """
+    mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+      publishablePublish(id: $id, input: $input) {
+        publishable {
+          availablePublicationsCount {
+            count
+          }
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    
+    result = graphql_request(mutation, {"id": collection_id, "input": publication_inputs})
+    
+    user_errors = result.get('data', {}).get('publishablePublish', {}).get('userErrors', [])
+    if user_errors:
+        print(f"[Collection] 發布失敗: {user_errors}")
+    else:
+        count = result.get('data', {}).get('publishablePublish', {}).get('publishable', {}).get('availablePublicationsCount', {}).get('count', 0)
+        print(f"[Collection] 已發布到 {count} 個銷售管道")
 
 
 def get_all_publication_ids():
@@ -221,7 +261,9 @@ def translate_with_chatgpt(title, description, size_spec=''):
 1. 絕對禁止日文（平假名、片假名）
 2. 商品名稱開頭必須是「WORKMAN」
 3. 尺寸欄位翻譯：サイズ→尺寸、着丈→衣長、身幅→身寬、肩幅→肩寬、袖丈→袖長
-4. 只回傳 JSON"""
+4. 完全忽略注意事項（ご注意、注意事項、ご了承、※記號開頭的警告文字等），不要翻譯這些內容
+5. 完全忽略價格相關內容（円、日圓、OFF、割引、値下げ等）
+6. 只回傳 JSON"""
 
     try:
         response = requests.post(
@@ -560,18 +602,36 @@ def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
     description = re.sub(r'<a[^>]*>.*?</a>', '', description)
     
     # 移除價格相關的句子（包含「日圓」「円」「OFF」「降價」等）
-    # 移除包含價格的整行或整段
     description = re.sub(r'[^<>]*\d+[,，]?\d*\s*日圓[^<>]*', '', description)
     description = re.sub(r'[^<>]*\d+[,，]?\d*\s*円[^<>]*', '', description)
     description = re.sub(r'[^<>]*\d+%\s*OFF[^<>]*', '', description, flags=re.IGNORECASE)
     description = re.sub(r'[^<>]*降價[^<>]*', '', description)
     description = re.sub(r'[^<>]*大幅[^<>]*', '', description)
     
-    # 清理殘留的空標籤和多餘空行
-    description = re.sub(r'<p>\s*</p>', '', description)
-    description = re.sub(r'<br\s*/?>\s*<br\s*/?>', '<br>', description)
-    description = re.sub(r'^\s*<br\s*/?>\s*', '', description)
+    # 移除注意事項相關內容（翻譯後可能殘留的）
+    description = re.sub(r'[^<>]*注意事項[^<>]*', '', description)
+    description = re.sub(r'[^<>]*請注意[^<>]*', '', description)
+    description = re.sub(r'[^<>]*敬請諒解[^<>]*', '', description)
+    description = re.sub(r'[^<>]*敬請見諒[^<>]*', '', description)
+    description = re.sub(r'[^<>]*※[^<>]*', '', description)  # 移除 ※ 開頭的警告文字
+    
+    # 徹底清理空白和空標籤
+    description = re.sub(r'<p>\s*</p>', '', description)  # 移除空的 <p> 標籤
+    description = re.sub(r'<br\s*/?>\s*<br\s*/?>', '<br>', description)  # 連續 br 變單一
+    description = re.sub(r'^\s*(<br\s*/?>)+', '', description)  # 移除開頭的 br
+    description = re.sub(r'(<br\s*/?>)+\s*$', '', description)  # 移除結尾的 br
+    description = re.sub(r'\n\s*\n', '\n', description)  # 移除連續空行
     description = description.strip()
+    
+    # 加入統一注意事項
+    notice = """
+<br><br>
+<p><strong>【請注意以下事項】</strong></p>
+<p>※不接受退換貨</p>
+<p>※開箱請全程錄影</p>
+<p>※因庫存有限，訂購時間不同可能會出現缺貨情況。</p>
+"""
+    description = description + notice
     
     manage_code = product_data['manage_code']
     cost = product_data['price']  # 日圓成本

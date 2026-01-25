@@ -658,6 +658,229 @@ def check_bulk_operation_status(operation_id=None):
         return result.get('data', {}).get('currentBulkOperation', {})
 
 
+# ========== 批量刪除功能 ==========
+
+def fetch_workman_product_ids():
+    """取得所有 WORKMAN 商品的 ID（使用分頁查詢）"""
+    all_ids = []
+    cursor = None
+    
+    while True:
+        if cursor:
+            query = """
+            query($cursor: String) {
+              products(first: 250, after: $cursor, query: "vendor:WORKMAN") {
+                edges {
+                  node {
+                    id
+                    title
+                    handle
+                  }
+                  cursor
+                }
+                pageInfo {
+                  hasNextPage
+                }
+              }
+            }
+            """
+            result = graphql_request(query, {"cursor": cursor})
+        else:
+            query = """
+            {
+              products(first: 250, query: "vendor:WORKMAN") {
+                edges {
+                  node {
+                    id
+                    title
+                    handle
+                  }
+                  cursor
+                }
+                pageInfo {
+                  hasNextPage
+                }
+              }
+            }
+            """
+            result = graphql_request(query)
+        
+        products = result.get('data', {}).get('products', {})
+        edges = products.get('edges', [])
+        
+        for edge in edges:
+            node = edge['node']
+            all_ids.append({
+                'id': node['id'],
+                'title': node['title'],
+                'handle': node['handle']
+            })
+            cursor = edge['cursor']
+        
+        if not products.get('pageInfo', {}).get('hasNextPage', False):
+            break
+        
+        time.sleep(0.5)  # 避免速率限制
+    
+    print(f"[INFO] 找到 {len(all_ids)} 個 WORKMAN 商品")
+    return all_ids
+
+
+def create_delete_jsonl(product_ids):
+    """產生刪除用的 JSONL 檔案"""
+    jsonl_filename = f"delete_workman_{int(time.time())}.jsonl"
+    jsonl_path = os.path.join(JSONL_DIR, jsonl_filename)
+    
+    with open(jsonl_path, 'w', encoding='utf-8') as f:
+        for product in product_ids:
+            # productDelete 的 input 格式
+            entry = {"input": {"id": product['id']}}
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    
+    print(f"[INFO] 刪除 JSONL 已產生: {jsonl_path} ({len(product_ids)} 個商品)")
+    return jsonl_path
+
+
+def run_bulk_delete_mutation(staged_upload_path):
+    """執行 Bulk Delete Mutation"""
+    query = """
+    mutation bulkOperationRunMutation($mutation: String!, $stagedUploadPath: String!) {
+      bulkOperationRunMutation(mutation: $mutation, stagedUploadPath: $stagedUploadPath) {
+        bulkOperation {
+          id
+          status
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    
+    # productDelete mutation
+    mutation = """
+    mutation call($input: ProductDeleteInput!) {
+      productDelete(input: $input) {
+        deletedProductId
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    
+    variables = {
+        "mutation": mutation,
+        "stagedUploadPath": staged_upload_path
+    }
+    
+    result = graphql_request(query, variables)
+    return result
+
+
+def run_delete_workman_products():
+    """執行批量刪除 WORKMAN 商品"""
+    global scrape_status
+    
+    scrape_status = {
+        "running": True,
+        "phase": "deleting",
+        "progress": 0,
+        "total": 0,
+        "current_product": "正在查詢 WORKMAN 商品...",
+        "products": [],
+        "errors": [],
+        "jsonl_file": "",
+        "bulk_operation_id": "",
+        "bulk_status": "",
+    }
+    
+    try:
+        # 1. 查詢所有 WORKMAN 商品
+        print("[Delete] 查詢 WORKMAN 商品...")
+        product_ids = fetch_workman_product_ids()
+        
+        if not product_ids:
+            scrape_status['current_product'] = '沒有找到 WORKMAN 商品'
+            scrape_status['running'] = False
+            return
+        
+        scrape_status['total'] = len(product_ids)
+        scrape_status['current_product'] = f'找到 {len(product_ids)} 個商品，準備刪除...'
+        
+        # 記錄要刪除的商品
+        for p in product_ids[:20]:  # 只顯示前 20 個
+            scrape_status['products'].append({
+                'title': p['title'],
+                'handle': p['handle'],
+                'variants': 0
+            })
+        
+        # 2. 產生刪除 JSONL
+        print("[Delete] 產生刪除 JSONL...")
+        jsonl_path = create_delete_jsonl(product_ids)
+        scrape_status['jsonl_file'] = jsonl_path
+        
+        # 3. 建立 Staged Upload
+        print("[Delete] 建立 Staged Upload...")
+        scrape_status['current_product'] = '上傳刪除清單...'
+        staged = create_staged_upload()
+        
+        if not staged:
+            scrape_status['errors'].append({'error': '建立 Staged Upload 失敗'})
+            scrape_status['running'] = False
+            return
+        
+        # 4. 上傳 JSONL
+        print("[Delete] 上傳 JSONL...")
+        if not upload_jsonl_to_staged(staged, jsonl_path):
+            scrape_status['errors'].append({'error': '上傳 JSONL 失敗'})
+            scrape_status['running'] = False
+            return
+        
+        # 5. 執行 Bulk Delete
+        print("[Delete] 執行批量刪除...")
+        scrape_status['current_product'] = '執行批量刪除...'
+        
+        staged_path = None
+        for param in staged['parameters']:
+            if param['name'] == 'key':
+                staged_path = param['value']
+                break
+        
+        if not staged_path:
+            staged_path = staged.get('resourceUrl', '')
+        
+        result = run_bulk_delete_mutation(staged_path)
+        
+        if 'errors' in result:
+            scrape_status['errors'].append({'error': str(result['errors'])})
+            scrape_status['running'] = False
+            return
+        
+        bulk_op = result.get('data', {}).get('bulkOperationRunMutation', {}).get('bulkOperation', {})
+        user_errors = result.get('data', {}).get('bulkOperationRunMutation', {}).get('userErrors', [])
+        
+        if user_errors:
+            scrape_status['errors'].append({'error': str(user_errors)})
+            scrape_status['running'] = False
+            return
+        
+        scrape_status['bulk_operation_id'] = bulk_op.get('id', '')
+        scrape_status['bulk_status'] = bulk_op.get('status', '')
+        scrape_status['current_product'] = f"批量刪除已啟動！正在刪除 {len(product_ids)} 個商品..."
+        
+        print(f"[Delete] 操作 ID: {bulk_op.get('id')}, 狀態: {bulk_op.get('status')}")
+        
+    except Exception as e:
+        scrape_status['errors'].append({'error': str(e)})
+        print(f"[ERROR] {e}")
+    finally:
+        scrape_status['running'] = False
+
+
 # ========== 主流程 ==========
 
 def run_scrape(category):
@@ -837,18 +1060,22 @@ def index():
         .btn-all { background: #7b1fa2; color: white; }
         .btn-upload { background: #d32f2f; color: white; font-size: 18px; padding: 15px 30px; }
         .btn-check { background: #455a64; color: white; }
+        .btn-delete { background: #b71c1c; color: white; }
         .btn:disabled { background: #ccc; cursor: not-allowed; transform: none; }
         #status { padding: 15px; background: #e3f2fd; border-radius: 8px; margin: 15px 0; }
         #log { height: 300px; overflow-y: auto; background: #263238; color: #aed581; padding: 15px; border-radius: 8px; font-family: monospace; font-size: 13px; }
         .progress { height: 8px; background: #e0e0e0; border-radius: 4px; margin: 10px 0; }
         .progress-bar { height: 100%; background: linear-gradient(90deg, #4caf50, #8bc34a); border-radius: 4px; transition: width 0.3s; }
+        .progress-bar-delete { background: linear-gradient(90deg, #f44336, #ff5722); }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
         th { background: #f5f5f5; }
         .phase { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; }
         .phase-scraping { background: #fff3e0; color: #e65100; }
         .phase-uploading { background: #e3f2fd; color: #1565c0; }
+        .phase-deleting { background: #ffebee; color: #c62828; }
         .phase-completed { background: #e8f5e9; color: #2e7d32; }
+        .warning-box { background: #fff3e0; border: 2px solid #ff9800; border-radius: 8px; padding: 15px; margin: 10px 0; }
     </style>
 </head>
 <body>
@@ -869,6 +1096,15 @@ def index():
         <p>爬取完成後，點擊下方按鈕批量上傳（數千商品只需幾分鐘）</p>
         <button class="btn btn-upload" id="uploadBtn" onclick="startUpload()" disabled>📤 批量上傳到 Shopify</button>
         <button class="btn btn-check" onclick="checkStatus()">🔍 檢查上傳狀態</button>
+    </div>
+    
+    <div class="card">
+        <h3>🗑️ 批量刪除 WORKMAN 商品</h3>
+        <div class="warning-box">
+            ⚠️ <strong>警告：此操作會刪除 Shopify 中所有 vendor 為 "WORKMAN" 的商品！</strong>
+        </div>
+        <button class="btn btn-delete" onclick="startDelete()">🗑️ 刪除所有 WORKMAN 商品</button>
+        <button class="btn btn-check" onclick="countProducts()">📊 查詢商品數量</button>
     </div>
     
     <div class="card">
@@ -920,6 +1156,35 @@ def index():
                 });
         }
         
+        function startDelete() {
+            if (!confirm('⚠️ 警告！\\n\\n此操作會刪除 Shopify 中所有 WORKMAN 商品！\\n\\n確定要繼續嗎？')) return;
+            if (!confirm('再次確認：真的要刪除所有 WORKMAN 商品嗎？')) return;
+            
+            fetch('/api/delete')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        log('❌ 錯誤: ' + data.error);
+                    } else {
+                        log('🗑️ 開始批量刪除...');
+                        pollStatus();
+                    }
+                });
+        }
+        
+        function countProducts() {
+            log('📊 正在查詢 WORKMAN 商品數量...');
+            fetch('/api/count')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        log('❌ 錯誤: ' + data.error);
+                    } else {
+                        log(`📊 目前有 ${data.count} 個 WORKMAN 商品`);
+                    }
+                });
+        }
+        
         function pollStatus() {
             fetch('/api/status')
                 .then(r => r.json())
@@ -933,7 +1198,7 @@ def index():
         
         function updateUI(data) {
             let phaseClass = 'phase-' + data.phase;
-            let phaseText = {scraping: '爬取中', uploading: '上傳中', completed: '完成'}[data.phase] || data.phase;
+            let phaseText = {scraping: '爬取中', uploading: '上傳中', deleting: '刪除中', completed: '完成'}[data.phase] || data.phase;
             
             let statusHtml = `<span class="phase ${phaseClass}">${phaseText}</span> `;
             statusHtml += data.current_product || '';
@@ -1029,6 +1294,37 @@ def api_test():
     load_shopify_token()
     result = graphql_request("{ shop { name } }")
     return jsonify(result)
+
+
+@app.route('/api/delete')
+def api_delete():
+    """批量刪除所有 WORKMAN 商品"""
+    if scrape_status['running']:
+        return jsonify({'error': '正在執行中'})
+    
+    thread = threading.Thread(target=run_delete_workman_products)
+    thread.start()
+    
+    return jsonify({'started': True})
+
+
+@app.route('/api/count')
+def api_count():
+    """查詢 WORKMAN 商品數量"""
+    try:
+        load_shopify_token()
+        query = """
+        {
+          productsCount(query: "vendor:WORKMAN") {
+            count
+          }
+        }
+        """
+        result = graphql_request(query)
+        count = result.get('data', {}).get('productsCount', {}).get('count', 0)
+        return jsonify({'count': count})
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 
 if __name__ == '__main__':

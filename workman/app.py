@@ -1805,6 +1805,12 @@ def index():
     <div class="card">
         <h3>📤 第二步：批量上傳到 Shopify</h3>
         <p>爬取完成後，點擊下方按鈕批量上傳（數千商品只需幾分鐘）</p>
+        <div style="margin: 10px 0; padding: 10px; background: #e8f5e9; border-radius: 8px;">
+            <label style="cursor: pointer;">
+                <input type="checkbox" id="autoPublish" checked style="margin-right: 8px;">
+                <strong>上傳完成後自動發布到所有銷售管道</strong>
+            </label>
+        </div>
         <button class="btn btn-upload" id="uploadBtn" onclick="startUpload()" disabled>📤 批量上傳到 Shopify</button>
         <button class="btn btn-check" onclick="checkStatus()">🔍 檢查上傳狀態</button>
         <button class="btn btn-check" onclick="checkResults()">📋 查看詳細結果</button>
@@ -1870,6 +1876,42 @@ def index():
                 .then(data => {
                     log('🚀 開始批量上傳...');
                     pollStatus();
+                    // 開始輪詢 bulk operation 狀態
+                    setTimeout(pollBulkStatus, 5000);
+                });
+        }
+        
+        function pollBulkStatus() {
+            fetch('/api/bulk_status')
+                .then(r => r.json())
+                .then(data => {
+                    let status = data.status || 'UNKNOWN';
+                    let count = data.objectCount || 0;
+                    
+                    document.getElementById('status').textContent = `Bulk Operation: ${status}, 處理數: ${count}`;
+                    
+                    if (status === 'COMPLETED') {
+                        log(`✅ 批量上傳完成！共處理 ${count} 個商品`);
+                        
+                        // 自動發布
+                        if (document.getElementById('autoPublish') && document.getElementById('autoPublish').checked) {
+                            log('📢 自動發布到所有銷售管道...');
+                            publishAll();
+                        } else {
+                            log('⚠️ 請點擊「📢 發布所有 WORKMAN 商品」按鈕來開啟銷售管道');
+                        }
+                    } else if (status === 'FAILED' || status === 'CANCELED') {
+                        log(`❌ 批量上傳失敗: ${status}`);
+                        if (data.errorCode) {
+                            log(`錯誤碼: ${data.errorCode}`);
+                        }
+                    } else if (status === 'RUNNING' || status === 'CREATED') {
+                        // 繼續輪詢
+                        setTimeout(pollBulkStatus, 3000);
+                    }
+                })
+                .catch(err => {
+                    log('❌ 檢查狀態失敗: ' + err);
                 });
         }
         
@@ -1885,6 +1927,17 @@ def index():
                     }
                     if (data.url) {
                         log(`📄 結果 URL: 有`);
+                    }
+                    
+                    // 如果完成了，提示發布
+                    if (status === 'COMPLETED') {
+                        log('✅ 批量上傳已完成！');
+                        if (document.getElementById('autoPublish') && document.getElementById('autoPublish').checked) {
+                            log('📢 自動發布中...');
+                            publishAll();
+                        } else {
+                            log('⚠️ 請點擊「📢 發布所有 WORKMAN 商品」按鈕來開啟銷售管道');
+                        }
                     }
                 });
         }

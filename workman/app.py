@@ -364,50 +364,99 @@ def get_total_pages(category_url):
         response = requests.get(url, headers=HEADERS, timeout=30)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 方法1：找「最後」連結
             last_link = soup.find('a', string='最後')
             if last_link and last_link.get('href'):
                 match = re.search(r'_p(\d+)', last_link['href'])
                 if match:
                     return int(match.group(1))
+            
+            # 方法2：找分頁連結中最大的數字
+            pagination = soup.find_all('a', href=re.compile(r'_p\d+'))
+            max_page = 1
+            for link in pagination:
+                href = link.get('href', '')
+                match = re.search(r'_p(\d+)', href)
+                if match:
+                    page_num = int(match.group(1))
+                    if page_num > max_page:
+                        max_page = page_num
+            
+            if max_page > 1:
+                return max_page
+            
+            # 方法3：找分頁區塊中的數字
+            pager = soup.find('div', class_=re.compile(r'pager|pagination'))
+            if pager:
+                page_links = pager.find_all('a')
+                for link in page_links:
+                    text = link.get_text(strip=True)
+                    if text.isdigit():
+                        page_num = int(text)
+                        if page_num > max_page:
+                            max_page = page_num
+                return max_page
+            
             return 1
-    except:
-        pass
+    except Exception as e:
+        print(f"[ERROR] 取得總頁數失敗: {e}")
     return 1
 
 
 def fetch_all_product_links(category_key):
-    """取得分類內所有商品連結"""
+    """取得分類內所有商品連結（支援多頁）"""
     category = CATEGORIES[category_key]
-    base_url = category['url']
-    total_pages = get_total_pages(base_url)
+    base_url = category['url']  # 例如: /shop/c/c51/
     
+    # 取得總頁數
+    total_pages = get_total_pages(base_url)
     print(f"[INFO] {category['collection']} 共 {total_pages} 頁")
     
     all_links = []
+    
     for page in range(1, total_pages + 1):
+        # 生成分頁 URL
+        # 第一頁: /shop/c/c51/
+        # 第二頁: /shop/c/c51_p2/
+        # 第三頁: /shop/c/c51_p3/
         if page == 1:
             page_url = SOURCE_URL + base_url
         else:
-            page_url = SOURCE_URL + base_url.replace('/', f'_p{page}/', 1)
+            # 把 /shop/c/c51/ 變成 /shop/c/c51_p2/
+            # 在最後的 / 前面插入 _p{page}
+            page_url = SOURCE_URL + base_url.rstrip('/') + f'_p{page}/'
+        
+        print(f"[INFO] 爬取第 {page}/{total_pages} 頁: {page_url}")
         
         try:
             response = requests.get(page_url, headers=HEADERS, timeout=30)
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
+                page_links_count = 0
+                
                 # 找所有連結，篩選出商品連結 (/shop/g/)
                 for link in soup.find_all('a', href=True):
                     href = link.get('href', '')
                     if '/shop/g/' in href:
                         full_url = SOURCE_URL + href if href.startswith('/') else href
+                        # 去除查詢參數，只保留基本 URL
+                        full_url = full_url.split('?')[0]
                         if full_url not in all_links:
                             all_links.append(full_url)
+                            page_links_count += 1
                             
-                print(f"[INFO] 第 {page} 頁找到 {len(all_links)} 個商品連結")
+                print(f"[INFO] 第 {page} 頁新增 {page_links_count} 個，累計 {len(all_links)} 個商品連結")
+            else:
+                print(f"[WARN] 第 {page} 頁 HTTP {response.status_code}")
+                # 如果返回非 200，可能已經沒有更多頁了
+                if response.status_code == 404:
+                    break
         except Exception as e:
             print(f"[ERROR] 頁面 {page} 載入失敗: {e}")
         
-        time.sleep(0.3)
+        time.sleep(0.5)  # 避免請求過快
     
     print(f"[INFO] {category['collection']} 共 {len(all_links)} 個商品")
     return all_links

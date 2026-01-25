@@ -534,6 +534,15 @@ def parse_product_page(url):
 def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
     """將商品資料轉換為 JSONL 格式（Shopify GraphQL ProductSetInput）"""
     
+    # 根據分類設定商品類型
+    PRODUCT_TYPES = {
+        'work': 'WORKMAN 作業服',
+        'mens': 'WORKMAN 男裝',
+        'womens': 'WORKMAN 女裝',
+        'kids': 'WORKMAN 兒童'
+    }
+    product_type = PRODUCT_TYPES.get(category_key, 'WORKMAN')
+    
     # 翻譯
     translated = translate_with_chatgpt(
         product_data['title'],
@@ -544,15 +553,28 @@ def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
     title = translated['title']
     description = translated['description']
     
-    # 移除說明文中的超連結（包含 <a> 標籤和其中的文字）
     import re
+    import html
+    
+    # 移除說明文中的超連結（包含 <a> 標籤和其中的文字）
     description = re.sub(r'<a[^>]*>.*?</a>', '', description)
-    # 也移除可能殘留的空行
+    
+    # 移除價格相關的句子（包含「日圓」「円」「OFF」「降價」等）
+    # 移除包含價格的整行或整段
+    description = re.sub(r'[^<>]*\d+[,，]?\d*\s*日圓[^<>]*', '', description)
+    description = re.sub(r'[^<>]*\d+[,，]?\d*\s*円[^<>]*', '', description)
+    description = re.sub(r'[^<>]*\d+%\s*OFF[^<>]*', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'[^<>]*降價[^<>]*', '', description)
+    description = re.sub(r'[^<>]*大幅[^<>]*', '', description)
+    
+    # 清理殘留的空標籤和多餘空行
     description = re.sub(r'<p>\s*</p>', '', description)
     description = re.sub(r'<br\s*/?>\s*<br\s*/?>', '<br>', description)
+    description = re.sub(r'^\s*<br\s*/?>\s*', '', description)
+    description = description.strip()
     
     manage_code = product_data['manage_code']
-    cost = product_data['price']
+    cost = product_data['price']  # 日圓成本
     colors = product_data['colors']
     sizes = product_data['sizes']
     images = product_data['images']
@@ -599,6 +621,7 @@ def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
         }
     
     # 建立 variants（ProductSetInput 格式）
+    # 加入 cost（成本）和 taxable: false
     variants = []
     
     if has_color_option and has_size_option:
@@ -609,6 +632,10 @@ def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
                     "price": selling_price,
                     "sku": f"{manage_code}-{color}-{size}",
                     "inventoryPolicy": "CONTINUE",
+                    "taxable": False,
+                    "inventoryItem": {
+                        "cost": cost  # 日圓成本
+                    },
                     "optionValues": [
                         {"optionName": "顏色", "name": color},
                         {"optionName": "尺寸", "name": size}
@@ -623,6 +650,10 @@ def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
                 "price": selling_price,
                 "sku": f"{manage_code}-{color}",
                 "inventoryPolicy": "CONTINUE",
+                "taxable": False,
+                "inventoryItem": {
+                    "cost": cost
+                },
                 "optionValues": [
                     {"optionName": "顏色", "name": color}
                 ]
@@ -636,6 +667,10 @@ def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
                 "price": selling_price,
                 "sku": f"{manage_code}-{size}",
                 "inventoryPolicy": "CONTINUE",
+                "taxable": False,
+                "inventoryItem": {
+                    "cost": cost
+                },
                 "optionValues": [
                     {"optionName": "尺寸", "name": size}
                 ]
@@ -649,28 +684,31 @@ def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
             "price": selling_price,
             "sku": manage_code,
             "inventoryPolicy": "CONTINUE",
+            "taxable": False,
+            "inventoryItem": {
+                "cost": cost
+            }
         }
         if variant_file:
             variant["file"] = variant_file
         variants.append(variant)
     
-    # 建立 SEO 描述（取說明前 160 字）
-    import html
-    seo_description = re.sub(r'<[^>]+>', '', description)  # 移除 HTML 標籤
-    seo_description = html.unescape(seo_description)  # 解碼 HTML entities
-    seo_description = seo_description[:160].strip()
+    # 建立 SEO 資訊（獨立撰寫，不使用說明文）
+    seo_title = f"{title} | WORKMAN 日本代購"
+    seo_description = f"日本 WORKMAN 官方正品代購。{title}，台灣現貨或日本直送，品質保證。GOYOUTATI 御用達日本伴手禮專門店。"
     
     # ProductSetInput 結構
     product_input = {
         "title": title,
         "descriptionHtml": description,
         "vendor": "WORKMAN",
+        "productType": product_type,
         "status": "ACTIVE",
         "handle": f"workman-{manage_code}",
         "tags": tags,
-        # SEO 資訊
+        # SEO 資訊（獨立撰寫）
         "seo": {
-            "title": title,
+            "title": seo_title,
             "description": seo_description
         },
         # 中繼欄位 - 來源連結
@@ -1373,6 +1411,13 @@ def run_test_single():
                     id
                     sku
                     price
+                    taxable
+                    inventoryItem {
+                      unitCost {
+                        amount
+                        currencyCode
+                      }
+                    }
                   }
                 }
               }
@@ -2034,6 +2079,17 @@ def index():
                         log('❌ 測試失敗: ' + JSON.stringify(data.errors));
                     } else if (data.test_result && data.test_result.id) {
                         const r = data.test_result;
+                        
+                        // 取得第一個 variant 的資訊
+                        let variantInfo = '(無)';
+                        if (r.variants && r.variants.edges && r.variants.edges.length > 0) {
+                            const v = r.variants.edges[0].node;
+                            const cost = v.inventoryItem?.unitCost?.amount || '(空)';
+                            const currency = v.inventoryItem?.unitCost?.currencyCode || '';
+                            const taxable = v.taxable === false ? '❌ 不課稅' : '✅ 課稅';
+                            variantInfo = `SKU: ${v.sku}, 價格: ${v.price}, 成本: ${cost} ${currency}, ${taxable}`;
+                        }
+                        
                         resultDiv.innerHTML = `
                             <strong style="color:green;">✅ 測試成功！</strong><br>
                             <table style="width:100%;border-collapse:collapse;margin-top:10px;">
@@ -2042,7 +2098,8 @@ def index():
                                 <tr><td style="padding:5px;border:1px solid #ddd;"><strong>Handle</strong></td><td style="padding:5px;border:1px solid #ddd;">${r.handle}</td></tr>
                                 <tr><td style="padding:5px;border:1px solid #ddd;"><strong>商品類型</strong></td><td style="padding:5px;border:1px solid #ddd;">${r.productType || '(空)'}</td></tr>
                                 <tr><td style="padding:5px;border:1px solid #ddd;"><strong>SEO 標題</strong></td><td style="padding:5px;border:1px solid #ddd;">${r.seo?.title || '(空)'}</td></tr>
-                                <tr><td style="padding:5px;border:1px solid #ddd;"><strong>SEO 描述</strong></td><td style="padding:5px;border:1px solid #ddd;">${(r.seo?.description || '(空)').substring(0, 50)}...</td></tr>
+                                <tr><td style="padding:5px;border:1px solid #ddd;"><strong>SEO 描述</strong></td><td style="padding:5px;border:1px solid #ddd;">${(r.seo?.description || '(空)').substring(0, 80)}...</td></tr>
+                                <tr><td style="padding:5px;border:1px solid #ddd;"><strong>Variant (第1個)</strong></td><td style="padding:5px;border:1px solid #ddd;">${variantInfo}</td></tr>
                                 <tr><td style="padding:5px;border:1px solid #ddd;"><strong>銷售管道</strong></td><td style="padding:5px;border:1px solid #ddd;">${r.published} 個</td></tr>
                             </table>
                             <p style="margin-top:10px;">👉 <a href="https://admin.shopify.com/store/goyoulink/products" target="_blank">前往 Shopify 後台查看</a></p>

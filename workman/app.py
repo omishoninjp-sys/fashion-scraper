@@ -651,31 +651,58 @@ def parse_product_page(url):
         if not sizes:
             sizes = ['FREE']
         
-        # 圖片
+        # 圖片 - 收集所有圖片並轉換為大圖
         images = []
-        # 主圖
-        main_img = soup.find('img', src=re.compile(r'/img/goods/L/\d+_t1\.jpg'))
-        if main_img:
-            img_src = main_img.get('src', '')
-            if img_src:
-                images.append(SOURCE_URL + img_src)
+        color_images = {}  # {顏色索引: 圖片URL}
         
-        # 顏色圖（大圖）
-        for i, color in enumerate(colors, 1):
-            color_img_url = f"{SOURCE_URL}/img/goods/L/{manage_code}_c{i}.jpg"
-            if color_img_url not in images:
-                images.append(color_img_url)
+        # 找所有圖片 (包含 _t1, _c1, _c2, _d1, _d2 等)
+        all_imgs = soup.find_all('img', src=re.compile(r'/img/goods/'))
+        seen_imgs = set()
         
-        # 詳細圖
-        detail_imgs = soup.find_all('img', src=re.compile(r'/img/goods/\d+/\d+_d\d+\.jpg'))
-        for img in detail_imgs:
+        for img in all_imgs:
             img_src = img.get('src', '')
-            if img_src:
+            if not img_src or img_src in seen_imgs:
+                continue
+            
+            # 跳過 icon 圖片
+            if '/icon/' in img_src or 'logo' in img_src:
+                continue
+            
+            # 提取檔名
+            filename_match = re.search(r'/(\d+_[a-z]\d+\.jpg)$', img_src)
+            if not filename_match:
+                filename_match = re.search(r'/(\d+_t\d+\.jpg)$', img_src)
+            
+            if filename_match:
+                filename = filename_match.group(1)
                 # 轉換為大圖 URL
-                large_url = re.sub(r'/img/goods/\d+/', '/img/goods/L/', img_src)
-                full_url = SOURCE_URL + large_url
-                if full_url not in images:
-                    images.append(full_url)
+                large_url = f"{SOURCE_URL}/img/goods/L/{filename}"
+                
+                if large_url not in seen_imgs:
+                    seen_imgs.add(large_url)
+                    
+                    # 主圖 (_t1) 放最前面
+                    if '_t1.' in filename:
+                        images.insert(0, large_url)
+                    # 顏色圖 (_c1, _c2...) 記錄對應關係
+                    elif '_c' in filename:
+                        images.append(large_url)
+                        # 提取顏色索引
+                        c_match = re.search(r'_c(\d+)\.', filename)
+                        if c_match:
+                            color_idx = int(c_match.group(1)) - 1  # 轉為 0-based
+                            color_images[color_idx] = large_url
+                    # 詳細圖 (_d1, _d2...)
+                    elif '_d' in filename:
+                        images.append(large_url)
+        
+        # 如果沒找到圖片，嘗試直接用管理番號組合
+        if not images and manage_code:
+            images.append(f"{SOURCE_URL}/img/goods/L/{manage_code}_t1.jpg")
+            for i in range(1, len(colors) + 1):
+                color_img = f"{SOURCE_URL}/img/goods/L/{manage_code}_c{i}.jpg"
+                images.append(color_img)
+                color_images[i-1] = color_img
         
         return {
             'url': url,
@@ -686,7 +713,8 @@ def parse_product_page(url):
             'description': description,
             'colors': colors,
             'sizes': sizes,
-            'images': images
+            'images': images,
+            'color_images': color_images  # 顏色對應圖片
         }
         
     except Exception as e:
@@ -820,21 +848,26 @@ def upload_to_shopify(product_data, collection_id, tags):
     
     # 處理圖片
     images_base64 = []
+    color_images = product_data.get('color_images', {})  # {顏色索引: URL}
+    image_url_to_position = {}  # {URL: position}
+    
     print(f"[圖片] 開始下載 {len(product_data['images'])} 張圖片...")
     
-    for idx, img_url in enumerate(product_data['images'][:10]):  # 最多 10 張
-        print(f"[圖片] 下載中 ({idx+1}/{len(product_data['images'][:10])})")
+    for idx, img_url in enumerate(product_data['images'][:15]):  # 最多 15 張
+        print(f"[圖片] 下載中 ({idx+1}/{min(len(product_data['images']), 15)}): {img_url[-30:]}")
         result = download_image_to_base64(img_url)
         
         if result['success']:
+            position = idx + 1
             images_base64.append({
                 'attachment': result['base64'],
-                'position': idx + 1,
+                'position': position,
                 'filename': f"workman_{manage_code}_{idx+1}.jpg"
             })
+            image_url_to_position[img_url] = position
             print(f"[圖片] ✓ 下載成功")
         else:
-            print(f"[圖片] ✗ 下載失敗: {img_url}")
+            print(f"[圖片] ✗ 下載失敗")
         
         time.sleep(0.3)
     
@@ -876,6 +909,7 @@ def upload_to_shopify(product_data, collection_id, tags):
         created_product = response.json()['product']
         product_id = created_product['id']
         created_variants = created_product.get('variants', [])
+        created_images = created_product.get('images', [])
         
         # 更新每個 variant 的 cost
         for cv in created_variants:
@@ -884,6 +918,36 @@ def upload_to_shopify(product_data, collection_id, tags):
                 headers=get_shopify_headers(),
                 json={'variant': {'id': cv['id'], 'cost': f"{cost:.2f}"}}
             )
+        
+        # 圖片與 Variant 對應
+        # 建立顏色到 variant IDs 的對應
+        color_to_variant_ids = {}
+        for cv in created_variants:
+            color = cv.get('option1', '')
+            if color:
+                if color not in color_to_variant_ids:
+                    color_to_variant_ids[color] = []
+                color_to_variant_ids[color].append(cv['id'])
+        
+        # 把顏色圖和對應的 variants 關聯
+        for color_idx, color_img_url in color_images.items():
+            if color_idx < len(colors):
+                color_name = colors[color_idx]
+                variant_ids = color_to_variant_ids.get(color_name, [])
+                
+                if variant_ids and color_img_url in image_url_to_position:
+                    position = image_url_to_position[color_img_url]
+                    # 找到對應的 Shopify 圖片
+                    for created_img in created_images:
+                        if created_img.get('position') == position:
+                            # 更新圖片的 variant_ids
+                            requests.put(
+                                shopify_api_url(f"products/{product_id}/images/{created_img['id']}.json"),
+                                headers=get_shopify_headers(),
+                                json={'image': {'id': created_img['id'], 'variant_ids': variant_ids}}
+                            )
+                            print(f"[圖片對應] 顏色 {color_name} 圖片已關聯 {len(variant_ids)} 個 variants")
+                            break
         
         if collection_id:
             add_product_to_collection(product_id, collection_id)

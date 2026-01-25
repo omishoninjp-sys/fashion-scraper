@@ -691,6 +691,65 @@ def check_bulk_operation_status(operation_id=None):
         return result.get('data', {}).get('currentBulkOperation', {})
 
 
+def get_bulk_operation_results():
+    """取得 Bulk Operation 的詳細結果"""
+    # 先取得最新的 bulk operation
+    status = check_bulk_operation_status()
+    
+    results = {
+        'status': status.get('status'),
+        'objectCount': status.get('objectCount'),
+        'errorCode': status.get('errorCode'),
+        'url': status.get('url'),
+    }
+    
+    # 如果有結果 URL，下載結果
+    if status.get('url'):
+        try:
+            response = requests.get(status['url'], timeout=30)
+            if response.status_code == 200:
+                # 結果是 JSONL 格式
+                lines = response.text.strip().split('\n')
+                results['total_results'] = len(lines)
+                results['sample_results'] = []
+                
+                errors = []
+                successes = []
+                
+                for line in lines[:50]:  # 只檢查前 50 行
+                    try:
+                        data = json.loads(line)
+                        
+                        # 檢查 userErrors
+                        if 'data' in data and 'productCreate' in data.get('data', {}):
+                            product_create = data['data']['productCreate']
+                            user_errors = product_create.get('userErrors', [])
+                            
+                            if user_errors:
+                                errors.append({
+                                    'errors': user_errors,
+                                    'input': data.get('__parentId', '')
+                                })
+                            elif product_create.get('product'):
+                                successes.append({
+                                    'id': product_create['product'].get('id'),
+                                    'title': product_create['product'].get('title', '')[:50]
+                                })
+                        
+                        results['sample_results'].append(data)
+                    except:
+                        pass
+                
+                results['errors'] = errors[:10]
+                results['successes'] = successes[:10]
+                results['error_count'] = len(errors)
+                results['success_count'] = len(successes)
+        except Exception as e:
+            results['fetch_error'] = str(e)
+    
+    return results
+
+
 # ========== 批量刪除功能 ==========
 
 def fetch_workman_product_ids():
@@ -1150,6 +1209,7 @@ def index():
         <p>爬取完成後，點擊下方按鈕批量上傳（數千商品只需幾分鐘）</p>
         <button class="btn btn-upload" id="uploadBtn" onclick="startUpload()" disabled>📤 批量上傳到 Shopify</button>
         <button class="btn btn-check" onclick="checkStatus()">🔍 檢查上傳狀態</button>
+        <button class="btn btn-check" onclick="checkResults()">📋 查看詳細結果</button>
     </div>
     
     <div class="card">
@@ -1218,6 +1278,49 @@ def index():
                     if (data.errorCode) {
                         log(`❌ 錯誤碼: ${data.errorCode}`);
                     }
+                    if (data.url) {
+                        log(`📄 結果 URL: 有`);
+                    }
+                });
+        }
+        
+        function checkResults() {
+            log('📋 正在取得詳細結果...');
+            fetch('/api/bulk_results')
+                .then(r => r.json())
+                .then(data => {
+                    log(`📊 狀態: ${data.status}`);
+                    log(`📊 總數: ${data.objectCount}`);
+                    
+                    if (data.error_count !== undefined) {
+                        log(`✅ 成功: ${data.success_count} 個`);
+                        log(`❌ 失敗: ${data.error_count} 個`);
+                    }
+                    
+                    if (data.successes && data.successes.length > 0) {
+                        log('--- 成功的商品 ---');
+                        for (let s of data.successes.slice(0, 5)) {
+                            log(`   ✓ ${s.title}`);
+                        }
+                    }
+                    
+                    if (data.errors && data.errors.length > 0) {
+                        log('--- 錯誤訊息 ---');
+                        for (let e of data.errors.slice(0, 5)) {
+                            log(`   ❌ ${JSON.stringify(e.errors)}`);
+                        }
+                    }
+                    
+                    if (data.fetch_error) {
+                        log(`❌ 取得結果失敗: ${data.fetch_error}`);
+                    }
+                    
+                    if (!data.url) {
+                        log('⚠️ 沒有結果 URL，可能操作尚未完成');
+                    }
+                })
+                .catch(err => {
+                    log('❌ 取得結果失敗: ' + err);
                 });
         }
         
@@ -1490,6 +1593,13 @@ def api_bulk_status():
     op_id = scrape_status.get('bulk_operation_id', '')
     status = check_bulk_operation_status(op_id if op_id else None)
     return jsonify(status)
+
+
+@app.route('/api/bulk_results')
+def api_bulk_results():
+    """取得 Bulk Operation 的詳細結果"""
+    results = get_bulk_operation_results()
+    return jsonify(results)
 
 
 @app.route('/api/test')

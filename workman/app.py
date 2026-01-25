@@ -125,16 +125,32 @@ def remove_japanese(text):
     return cleaned
 
 
-def translate_with_chatgpt(title, description):
+def translate_with_chatgpt(title, description, size_spec=''):
+    # 準備尺寸規格的純文字版本（用於翻譯）
+    size_spec_text = ''
+    if size_spec:
+        print(f"[翻譯] 收到尺寸規格 HTML: {len(size_spec)} 字元")
+        # 從 HTML 中提取表格文字（BeautifulSoup 已在頂部 import）
+        spec_soup = BeautifulSoup(size_spec, 'html.parser')
+        rows = spec_soup.find_all('tr')
+        for row in rows:
+            cells = row.find_all(['th', 'td'])
+            row_text = ' | '.join([cell.get_text(strip=True) for cell in cells])
+            size_spec_text += row_text + '\n'
+        print(f"[翻譯] 尺寸表純文字:\n{size_spec_text[:200]}...")
+    
     prompt = f"""你是專業的日本商品翻譯和 SEO 專家。請將以下日本服飾品牌商品資訊翻譯成繁體中文，並優化 SEO。
 
 商品名稱（日文）：{title}
 商品說明：{description[:1500] if description else ''}
+尺寸規格表：
+{size_spec_text if size_spec_text else '無'}
 
 請回傳 JSON 格式（不要加 markdown 標記）：
 {{
     "title": "翻譯後的商品名稱（繁體中文，簡潔有力，前面加上 WORKMAN）",
     "description": "翻譯後的商品說明（繁體中文，保留原意但更流暢，適合電商展示，每個重點用 <br> 換行）",
+    "size_spec_translated": "翻譯後的尺寸規格（如果有的話，把日文欄位名稱翻譯成中文，例如：サイズ→尺寸、対応身長→適合身高、対応胸囲→適合胸圍、胸囲→胸圍、着丈→衣長、肩幅→肩寬、袖丈→袖長、ウエスト→腰圍、ヒップ→臀圍、股下→褲檔長、わたり→大腿圍，格式保持：行1|行2|行3...，每行用換行分隔）",
     "page_title": "SEO 頁面標題（繁體中文，包含品牌和商品特色，50-60字以內）",
     "meta_description": "SEO 描述（繁體中文，吸引點擊，包含關鍵字，100字以內）"
 }}
@@ -167,7 +183,7 @@ def translate_with_chatgpt(title, description):
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0,
-                "max_tokens": 1000
+                "max_tokens": 1500
             },
             timeout=60
         )
@@ -187,6 +203,7 @@ def translate_with_chatgpt(title, description):
             
             trans_title = translated.get('title', title)
             trans_desc = translated.get('description', description)
+            trans_size_spec = translated.get('size_spec_translated', '')
             trans_page_title = translated.get('page_title', '')
             trans_meta_desc = translated.get('meta_description', '')
             
@@ -197,6 +214,9 @@ def translate_with_chatgpt(title, description):
             if contains_japanese(trans_desc):
                 print(f"[警告] 描述包含日文，正在移除")
                 trans_desc = remove_japanese(trans_desc)
+            if contains_japanese(trans_size_spec):
+                print(f"[警告] 尺寸規格包含日文，正在移除")
+                trans_size_spec = remove_japanese(trans_size_spec)
             if contains_japanese(trans_page_title):
                 trans_page_title = remove_japanese(trans_page_title)
             if contains_japanese(trans_meta_desc):
@@ -205,10 +225,18 @@ def translate_with_chatgpt(title, description):
             if not trans_title.startswith('WORKMAN'):
                 trans_title = f"WORKMAN {trans_title}"
             
+            # 如果有尺寸規格，重建 HTML 表格
+            size_spec_html = ''
+            if trans_size_spec and size_spec:
+                print(f"[尺寸表] 翻譯結果: {trans_size_spec[:100]}...")
+                size_spec_html = build_size_table_html(trans_size_spec)
+                print(f"[尺寸表] HTML 長度: {len(size_spec_html)} 字元")
+            
             return {
                 'success': True,
                 'title': trans_title,
                 'description': trans_desc,
+                'size_spec_html': size_spec_html,
                 'page_title': trans_page_title,
                 'meta_description': trans_meta_desc
             }
@@ -218,6 +246,7 @@ def translate_with_chatgpt(title, description):
                 'success': False,
                 'title': f"WORKMAN {title}",
                 'description': description,
+                'size_spec_html': size_spec,
                 'page_title': '',
                 'meta_description': ''
             }
@@ -228,9 +257,47 @@ def translate_with_chatgpt(title, description):
             'success': False,
             'title': f"WORKMAN {title}",
             'description': description,
+            'size_spec_html': size_spec,
             'page_title': '',
             'meta_description': ''
         }
+
+
+def build_size_table_html(size_spec_text):
+    """將翻譯後的尺寸規格文字轉換成 HTML 表格"""
+    if not size_spec_text:
+        return ''
+    
+    lines = [line.strip() for line in size_spec_text.strip().split('\n') if line.strip()]
+    if not lines:
+        return ''
+    
+    html = '<div class="size-spec"><h3>📏 尺寸規格</h3>'
+    html += '<table style="border-collapse: collapse; width: 100%; margin: 10px 0;">'
+    
+    for i, line in enumerate(lines):
+        cells = [cell.strip() for cell in line.split('|')]
+        if i == 0:
+            # 第一行是標題
+            html += '<tr style="background-color: #f5f5f5;">'
+            for cell in cells:
+                html += f'<th style="border: 1px solid #ddd; padding: 8px; text-align: center;">{cell}</th>'
+            html += '</tr>'
+        else:
+            html += '<tr>'
+            for j, cell in enumerate(cells):
+                if j == 0:
+                    # 第一列是標題
+                    html += f'<td style="border: 1px solid #ddd; padding: 8px; font-weight: bold; background-color: #fafafa;">{cell}</td>'
+                else:
+                    html += f'<td style="border: 1px solid #ddd; padding: 8px; text-align: center;">{cell}</td>'
+            html += '</tr>'
+    
+    html += '</table>'
+    html += '<p style="font-size: 12px; color: #666;">※ 尺寸可能因商品而有些許誤差</p>'
+    html += '</div>'
+    
+    return html
 
 
 def download_image_to_base64(img_url, max_retries=3):
@@ -604,13 +671,61 @@ def parse_product_page(url):
             if manage_dd:
                 manage_code = manage_dd.get_text(strip=True)
         
-        # 商品說明
+        # ===== 商品說明（從 tab 區塊取得）=====
         description = ''
-        desc_dt = soup.find('dt', string='商品説明')
-        if desc_dt:
-            desc_dd = desc_dt.find_next_sibling('dd')
+        size_spec = ''
+        
+        # 商品説明 - 在 block-goods-comment1 裡
+        comment1 = soup.find('dl', class_='block-goods-comment1')
+        if comment1:
+            desc_dd = comment1.find('dd', class_='js-goods-tabContents')
             if desc_dd:
-                description = str(desc_dd)
+                # 移除不需要的元素（script, style, visumo 等）
+                for tag in desc_dd.find_all(['script', 'style']):
+                    tag.decompose()
+                for tag in desc_dd.find_all(class_=re.compile(r'hacobune|visumo|revico')):
+                    tag.decompose()
+                
+                # 取得內容
+                desc_content = []
+                for elem in desc_dd.children:
+                    if hasattr(elem, 'name'):
+                        # 處理段落
+                        if elem.name in ['p', 'div']:
+                            text = elem.get_text(strip=True)
+                            if text:
+                                # 保留 HTML 結構
+                                desc_content.append(str(elem))
+                        # 處理分隔線
+                        elif elem.name == 'hr':
+                            desc_content.append('<hr>')
+                
+                description = '\n'.join(desc_content)
+        
+        # 尺寸規格 - 在 block-goods-comment2 裡
+        comment2 = soup.find('dl', class_='block-goods-comment2')
+        if comment2:
+            spec_dd = comment2.find('dd', class_='js-goods-tabContents')
+            if spec_dd:
+                # 找尺寸表
+                table = spec_dd.find('table')
+                if table:
+                    # 清理表格，保留結構
+                    size_spec = str(table)
+                    
+                    # 取得表格後的備註
+                    for p in spec_dd.find_all('p'):
+                        text = p.get_text(strip=True)
+                        if text and 'サイズガイド' not in text:
+                            size_spec += f'\n<p>{text}</p>'
+        
+        # 如果沒有從 tab 區塊取得，嘗試舊方法
+        if not description:
+            desc_dt = soup.find('dt', string='商品説明')
+            if desc_dt:
+                desc_dd = desc_dt.find_next_sibling('dd')
+                if desc_dd:
+                    description = str(desc_dd)
         
         # ===== 顏色和圖片解析（從 gallery 區塊） =====
         colors = []
@@ -727,6 +842,10 @@ def parse_product_page(url):
             images.append(f"{SOURCE_URL}/img/goods/L/{manage_code}_t1.jpg")
         
         print(f"[解析] {title[:20]} - 顏色: {colors}, 尺寸: {sizes}, 圖片: {len(images)} 張")
+        if description:
+            print(f"[解析] 商品說明: {len(description)} 字元")
+        if size_spec:
+            print(f"[解析] 尺寸規格: 有表格")
         if images:
             print(f"[解析] 圖片列表: {[url.split('/')[-1] for url in images[:5]]}")
         if color_images:
@@ -739,6 +858,7 @@ def parse_product_page(url):
             'product_code': product_code,
             'manage_code': manage_code,
             'description': description,
+            'size_spec': size_spec,  # 新增尺寸規格
             'colors': colors,
             'sizes': sizes,
             'images': images,
@@ -790,13 +910,19 @@ def upload_to_shopify(product_data, collection_id, tags):
     
     original_title = product_data['title']
     description = product_data['description']
+    size_spec = product_data.get('size_spec', '')
     manage_code = product_data['manage_code']
     cost = product_data['price']
     colors = product_data['colors']
     sizes = product_data['sizes']
     
     print(f"[翻譯] 正在翻譯: {original_title[:30]}...")
-    translated = translate_with_chatgpt(original_title, description)
+    translated = translate_with_chatgpt(original_title, description, size_spec)
+    
+    # 組合商品說明和尺寸表
+    body_html = translated['description']
+    if translated.get('size_spec_html'):
+        body_html += '<br><br>' + translated['size_spec_html']
     
     selling_price = calculate_selling_price(cost, DEFAULT_WEIGHT)
     
@@ -906,7 +1032,7 @@ def upload_to_shopify(product_data, collection_id, tags):
     shopify_product = {
         'product': {
             'title': translated['title'],
-            'body_html': translated['description'],
+            'body_html': body_html,  # 使用組合後的商品說明 + 尺寸表
             'vendor': 'WORKMAN',
             'product_type': '',
             'status': 'active',

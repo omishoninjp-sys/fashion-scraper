@@ -918,12 +918,25 @@ def run_scrape(category):
             tags = cat_info['tags']
             
             scrape_status['current_product'] = f"正在取得 {cat_info['collection']} 商品連結..."
+            print(f"[DEBUG] 開始取得 {cat_info['collection']} 商品連結...")
+            
             product_links = fetch_all_product_links(cat_key)
+            
+            print(f"[DEBUG] 取得 {len(product_links)} 個商品連結")
+            
+            if not product_links:
+                error_msg = f"{cat_info['collection']} 取得 0 個商品連結，可能是網路問題或網站結構變更"
+                print(f"[ERROR] {error_msg}")
+                scrape_status['errors'].append({'error': error_msg})
+                scrape_status['current_product'] = error_msg
+                continue
+            
             scrape_status['total'] += len(product_links)
+            scrape_status['current_product'] = f"找到 {len(product_links)} 個商品，開始處理..."
             
             for idx, link in enumerate(product_links):
                 scrape_status['progress'] += 1
-                scrape_status['current_product'] = f"處理中: {link[-30:]}"
+                scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {link.split('/')[-2]}"
                 
                 product_data = parse_product_page(link)
                 
@@ -1082,6 +1095,13 @@ def index():
     <h1>🏭 WORKMAN 爬蟲 (Bulk Operations 版)</h1>
     
     <div class="card">
+        <h3>🔗 連線測試</h3>
+        <p>爬取前先測試是否能連接到 workman.jp</p>
+        <button class="btn btn-check" onclick="testConnection()">🔗 測試連線 workman.jp</button>
+        <button class="btn btn-check" onclick="testShopify()">🔗 測試連線 Shopify</button>
+    </div>
+    
+    <div class="card">
         <h3>📥 第一步：爬取商品 → 產生 JSONL</h3>
         <p>選擇分類開始爬取，完成後會產生 JSONL 檔案</p>
         <button class="btn btn-work" onclick="startScrape('work')">🔧 作業服</button>
@@ -1199,10 +1219,54 @@ def index():
                 });
         }
         
+        function testConnection() {
+            log('🔗 測試連線 workman.jp...');
+            fetch('/api/test_workman')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.homepage && data.homepage.ok) {
+                        log('✅ workman.jp 主頁連線成功');
+                    } else {
+                        log('❌ workman.jp 主頁連線失敗: ' + JSON.stringify(data.homepage));
+                    }
+                    
+                    if (data.kids_page && data.kids_page.ok) {
+                        log(`✅ 兒童服分類頁連線成功，找到 ${data.kids_page.goods_links_found || 0} 個商品連結`);
+                        if (data.kids_page.first_link) {
+                            log(`   第一個連結: ${data.kids_page.first_link}`);
+                        }
+                    } else {
+                        log('❌ 兒童服分類頁連線失敗: ' + JSON.stringify(data.kids_page));
+                    }
+                })
+                .catch(err => {
+                    log('❌ 測試失敗: ' + err);
+                });
+        }
+        
+        function testShopify() {
+            log('🔗 測試連線 Shopify...');
+            fetch('/api/test')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.data && data.data.shop) {
+                        log('✅ Shopify 連線成功: ' + data.data.shop.name);
+                    } else if (data.errors) {
+                        log('❌ Shopify 連線失敗: ' + JSON.stringify(data.errors));
+                    } else {
+                        log('⚠️ Shopify 回應: ' + JSON.stringify(data));
+                    }
+                })
+                .catch(err => {
+                    log('❌ 測試失敗: ' + err);
+                });
+        }
+        
         function resetTracking() {
             lastProductCount = 0;
             lastProgress = 0;
             lastPhase = '';
+            lastErrorCount = 0;
         }
         
         function pollStatus() {
@@ -1275,19 +1339,27 @@ def index():
             }
             
             // 錯誤記錄
-            if (data.errors.length > 0) {
-                let lastError = data.errors[data.errors.length - 1];
-                if (lastError.url) {
-                    log(`❌ 失敗: ${lastError.url.split('/').pop()}`);
+            if (data.errors.length > lastErrorCount) {
+                let newErrors = data.errors.slice(lastErrorCount);
+                for (let err of newErrors) {
+                    if (err.error) {
+                        log(`❌ ${err.error}`);
+                    } else if (err.url) {
+                        log(`❌ 失敗: ${err.url.split('/').pop()}`);
+                    }
                 }
+                lastErrorCount = data.errors.length;
             }
         }
+        
+        let lastErrorCount = 0;
         
         function log(msg) {
             let logDiv = document.getElementById('log');
             let time = new Date().toLocaleTimeString();
-            // 避免重複訊息
-            if (!logDiv.innerHTML.includes(msg)) {
+            // 避免重複訊息（只檢查最近 50 行）
+            let recentLog = logDiv.innerHTML.substring(0, 5000);
+            if (!recentLog.includes(msg.substring(0, 50))) {
                 logDiv.innerHTML = `[${time}] ${msg}\n` + logDiv.innerHTML;
             }
         }
@@ -1379,6 +1451,46 @@ def api_count():
         return jsonify({'count': count})
     except Exception as e:
         return jsonify({'error': str(e)})
+
+
+@app.route('/api/test_workman')
+def api_test_workman():
+    """測試連線到 workman.jp"""
+    results = {}
+    
+    # 測試主頁
+    try:
+        response = requests.get(SOURCE_URL, headers=HEADERS, timeout=10)
+        results['homepage'] = {
+            'status': response.status_code,
+            'ok': response.status_code == 200
+        }
+    except Exception as e:
+        results['homepage'] = {'error': str(e), 'ok': False}
+    
+    # 測試兒童服分類頁
+    try:
+        response = requests.get(SOURCE_URL + '/shop/c/c54/', headers=HEADERS, timeout=10)
+        results['kids_page'] = {
+            'status': response.status_code,
+            'ok': response.status_code == 200
+        }
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            product_links = soup.find_all('a', class_='block-link')
+            results['kids_page']['product_links_found'] = len(product_links)
+            
+            # 檢查有多少是商品連結
+            goods_links = [l for l in product_links if '/shop/g/' in l.get('href', '')]
+            results['kids_page']['goods_links_found'] = len(goods_links)
+            
+            if goods_links:
+                results['kids_page']['first_link'] = goods_links[0].get('href', '')
+    except Exception as e:
+        results['kids_page'] = {'error': str(e), 'ok': False}
+    
+    return jsonify(results)
 
 
 if __name__ == '__main__':

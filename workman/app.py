@@ -439,7 +439,7 @@ def parse_product_page(url):
 
 
 def product_to_jsonl_entry(product_data, tags):
-    """將商品資料轉換為 JSONL 格式（Shopify GraphQL ProductInput）"""
+    """將商品資料轉換為 JSONL 格式（Shopify GraphQL ProductSetInput）"""
     
     # 翻譯
     translated = translate_with_chatgpt(
@@ -458,67 +458,71 @@ def product_to_jsonl_entry(product_data, tags):
     
     selling_price = calculate_selling_price(cost, DEFAULT_WEIGHT)
     
-    # 建立 variants
+    # 建立 productOptions（ProductSetInput 格式）
+    product_options = []
+    has_color_option = len(colors) > 1 or (len(colors) == 1 and colors[0] != '標準')
+    has_size_option = len(sizes) > 1 or (len(sizes) == 1 and sizes[0] != 'FREE')
+    
+    if has_color_option:
+        product_options.append({
+            "name": "顏色",
+            "values": [{"name": c} for c in colors]
+        })
+    
+    if has_size_option:
+        product_options.append({
+            "name": "尺寸",
+            "values": [{"name": s} for s in sizes]
+        })
+    
+    # 建立 variants（ProductSetInput 格式）
     variants = []
     
-    if len(colors) > 1 and len(sizes) > 1:
+    if has_color_option and has_size_option:
         # 顏色 × 尺寸
         for color in colors:
             for size in sizes:
-                variants.append({
-                    "price": str(selling_price),
+                variant = {
+                    "price": selling_price,
                     "sku": f"{manage_code}-{color}-{size}",
                     "inventoryPolicy": "CONTINUE",
-                    "inventoryManagement": None,
-                    "weight": DEFAULT_WEIGHT,
-                    "weightUnit": "KILOGRAMS",
-                    "options": [color, size]
-                })
-    elif len(colors) > 1:
+                    "optionValues": [
+                        {"optionName": "顏色", "name": color},
+                        {"optionName": "尺寸", "name": size}
+                    ]
+                }
+                variants.append(variant)
+    elif has_color_option:
         for color in colors:
-            variants.append({
-                "price": str(selling_price),
+            variant = {
+                "price": selling_price,
                 "sku": f"{manage_code}-{color}",
                 "inventoryPolicy": "CONTINUE",
-                "inventoryManagement": None,
-                "weight": DEFAULT_WEIGHT,
-                "weightUnit": "KILOGRAMS",
-                "options": [color]
-            })
-    elif len(sizes) > 1:
+                "optionValues": [
+                    {"optionName": "顏色", "name": color}
+                ]
+            }
+            variants.append(variant)
+    elif has_size_option:
         for size in sizes:
-            variants.append({
-                "price": str(selling_price),
+            variant = {
+                "price": selling_price,
                 "sku": f"{manage_code}-{size}",
                 "inventoryPolicy": "CONTINUE",
-                "inventoryManagement": None,
-                "weight": DEFAULT_WEIGHT,
-                "weightUnit": "KILOGRAMS",
-                "options": [size]
-            })
+                "optionValues": [
+                    {"optionName": "尺寸", "name": size}
+                ]
+            }
+            variants.append(variant)
     else:
+        # 沒有選項
         variants.append({
-            "price": str(selling_price),
+            "price": selling_price,
             "sku": manage_code,
             "inventoryPolicy": "CONTINUE",
-            "inventoryManagement": None,
-            "weight": DEFAULT_WEIGHT,
-            "weightUnit": "KILOGRAMS",
         })
     
-    # 建立 options
-    options = []
-    if len(colors) > 1 or (len(colors) == 1 and colors[0] != '標準'):
-        options.append("顏色")
-    if len(sizes) > 1 or (len(sizes) == 1 and sizes[0] != 'FREE'):
-        options.append("尺寸")
-    
-    # 建立 images（使用原始 URL，Shopify 會自動抓取）
-    image_inputs = []
-    for img_url in images:
-        image_inputs.append({"src": img_url})
-    
-    # ProductInput 結構
+    # ProductSetInput 結構
     product_input = {
         "title": title,
         "descriptionHtml": description,
@@ -529,26 +533,29 @@ def product_to_jsonl_entry(product_data, tags):
         "tags": tags,
     }
     
-    if options:
-        product_input["options"] = options
+    # 加入選項
+    if product_options:
+        product_input["productOptions"] = product_options
     
+    # 加入 variants
     if variants:
         product_input["variants"] = variants
     
-    if image_inputs:
-        product_input["images"] = image_inputs
+    # 加入圖片（使用 files）
+    if images:
+        product_input["files"] = [
+            {
+                "originalSource": img_url,
+                "contentType": "IMAGE"
+            }
+            for img_url in images[:10]
+        ]
     
-    # Metafield for source URL
-    product_input["metafields"] = [
-        {
-            "namespace": "custom",
-            "key": "link",
-            "value": product_data['url'],
-            "type": "url"
-        }
-    ]
-    
-    return {"input": product_input}
+    # 加入 synchronous 參數，變數名稱是 productSet（不是 input）
+    return {
+        "productSet": product_input,
+        "synchronous": True
+    }
 
 
 # ========== Bulk Operations ==========
@@ -624,10 +631,11 @@ def run_bulk_mutation(staged_upload_path):
     }
     """
     
-    # productCreate mutation
+    # 使用 productSet mutation（2024 年後的新 API 格式）
+    # 變數名稱必須是 $productSet（不是 $input）
     mutation = """
-    mutation call($input: ProductInput!) {
-      productCreate(input: $input) {
+    mutation call($productSet: ProductSetInput!, $synchronous: Boolean!) {
+      productSet(synchronous: $synchronous, input: $productSet) {
         product {
           id
           title

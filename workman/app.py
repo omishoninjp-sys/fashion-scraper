@@ -1124,11 +1124,15 @@ def index():
         function startScrape(category) {
             if (!confirm(`確定要爬取 ${category} 分類？`)) return;
             
+            // 重置狀態
+            resetTracking();
             document.getElementById('uploadBtn').disabled = true;
+            document.getElementById('log').innerHTML = '';
+            
             fetch('/api/start?category=' + category)
                 .then(r => r.json())
                 .then(data => {
-                    log('開始爬取: ' + category);
+                    log('🚀 開始爬取: ' + category);
                     pollStatus();
                 });
         }
@@ -1140,10 +1144,12 @@ def index():
             }
             if (!confirm('確定要批量上傳到 Shopify？')) return;
             
+            resetTracking();
+            
             fetch('/api/upload?file=' + encodeURIComponent(currentJsonlFile))
                 .then(r => r.json())
                 .then(data => {
-                    log('開始批量上傳...');
+                    log('🚀 開始批量上傳...');
                     pollStatus();
                 });
         }
@@ -1152,13 +1158,21 @@ def index():
             fetch('/api/bulk_status')
                 .then(r => r.json())
                 .then(data => {
-                    log('Bulk Operation 狀態: ' + JSON.stringify(data, null, 2));
+                    let status = data.status || 'UNKNOWN';
+                    let count = data.objectCount || 0;
+                    log(`📊 Bulk 狀態: ${status}, 處理數: ${count}`);
+                    if (data.errorCode) {
+                        log(`❌ 錯誤碼: ${data.errorCode}`);
+                    }
                 });
         }
         
         function startDelete() {
             if (!confirm('⚠️ 警告！\\n\\n此操作會刪除 Shopify 中所有 WORKMAN 商品！\\n\\n確定要繼續嗎？')) return;
             if (!confirm('再次確認：真的要刪除所有 WORKMAN 商品嗎？')) return;
+            
+            resetTracking();
+            document.getElementById('log').innerHTML = '';
             
             fetch('/api/delete')
                 .then(r => r.json())
@@ -1185,34 +1199,55 @@ def index():
                 });
         }
         
+        function resetTracking() {
+            lastProductCount = 0;
+            lastProgress = 0;
+            lastPhase = '';
+        }
+        
         function pollStatus() {
             fetch('/api/status')
                 .then(r => r.json())
                 .then(data => {
                     updateUI(data);
                     if (data.running) {
-                        setTimeout(pollStatus, 2000);
+                        setTimeout(pollStatus, 1000);  // 1 秒更新一次
                     }
                 });
         }
         
+        let lastProductCount = 0;
+        let lastProgress = 0;
+        let lastPhase = '';
+        
         function updateUI(data) {
             let phaseClass = 'phase-' + data.phase;
             let phaseText = {scraping: '爬取中', uploading: '上傳中', deleting: '刪除中', completed: '完成'}[data.phase] || data.phase;
+            
+            // 階段變化時記錄
+            if (data.phase !== lastPhase) {
+                if (data.phase === 'scraping') log('📥 開始爬取商品...');
+                else if (data.phase === 'uploading') log('📤 開始上傳到 Shopify...');
+                else if (data.phase === 'deleting') log('🗑️ 開始刪除商品...');
+                else if (data.phase === 'completed') log('✅ 作業完成！');
+                lastPhase = data.phase;
+            }
             
             let statusHtml = `<span class="phase ${phaseClass}">${phaseText}</span> `;
             statusHtml += data.current_product || '';
             
             if (data.total > 0) {
                 statusHtml += `<br>進度: ${data.progress} / ${data.total}`;
+                let pct = (data.progress / data.total * 100).toFixed(1);
+                statusHtml += ` (${pct}%)`;
             }
             if (data.jsonl_file) {
-                statusHtml += `<br>📄 JSONL: ${data.jsonl_file}`;
+                statusHtml += `<br>📄 JSONL: ${data.jsonl_file.split('/').pop()}`;
                 currentJsonlFile = data.jsonl_file;
                 document.getElementById('uploadBtn').disabled = false;
             }
             if (data.bulk_operation_id) {
-                statusHtml += `<br>🔄 Bulk ID: ${data.bulk_operation_id}`;
+                statusHtml += `<br>🔄 Bulk ID: ${data.bulk_operation_id.split('/').pop()}`;
                 statusHtml += `<br>📊 狀態: ${data.bulk_status}`;
             }
             if (data.errors.length > 0) {
@@ -1224,10 +1259,26 @@ def index():
             let pct = data.total > 0 ? (data.progress / data.total * 100) : 0;
             document.getElementById('progressBar').style.width = pct + '%';
             
-            if (data.products.length > 0) {
-                let latest = data.products.slice(-5).reverse();
-                for (let p of latest) {
-                    log(`✓ ${p.title} (${p.variants} variants)`);
+            // 進度變化時記錄
+            if (data.progress > lastProgress && data.progress % 10 === 0) {
+                log(`📊 進度: ${data.progress} / ${data.total}`);
+            }
+            lastProgress = data.progress;
+            
+            // 新商品時記錄
+            if (data.products.length > lastProductCount) {
+                let newProducts = data.products.slice(lastProductCount);
+                for (let p of newProducts) {
+                    log(`✓ ${p.title}`);
+                }
+                lastProductCount = data.products.length;
+            }
+            
+            // 錯誤記錄
+            if (data.errors.length > 0) {
+                let lastError = data.errors[data.errors.length - 1];
+                if (lastError.url) {
+                    log(`❌ 失敗: ${lastError.url.split('/').pop()}`);
                 }
             }
         }
@@ -1235,7 +1286,10 @@ def index():
         function log(msg) {
             let logDiv = document.getElementById('log');
             let time = new Date().toLocaleTimeString();
-            logDiv.innerHTML = `[${time}] ${msg}\n` + logDiv.innerHTML;
+            // 避免重複訊息
+            if (!logDiv.innerHTML.includes(msg)) {
+                logDiv.innerHTML = `[${time}] ${msg}\n` + logDiv.innerHTML;
+            }
         }
         
         // 初始載入狀態

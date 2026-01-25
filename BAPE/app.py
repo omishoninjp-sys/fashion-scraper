@@ -13,6 +13,7 @@ BAPE 商品爬蟲 + Shopify 上架工具
 
 from flask import Flask, jsonify
 import requests
+from bs4 import BeautifulSoup
 import re
 import json
 import os
@@ -127,16 +128,22 @@ def remove_japanese(text):
     return cleaned
 
 
-def translate_with_chatgpt(title, description):
+def translate_with_chatgpt(title, description, size_spec=''):
+    # 準備尺寸規格文字
+    size_spec_section = ''
+    if size_spec:
+        size_spec_section = f"\n尺寸規格表：\n{size_spec}"
+    
     prompt = f"""你是專業的日本商品翻譯和 SEO 專家。請將以下日本服飾品牌商品資訊翻譯成繁體中文，並優化 SEO。
 
 商品名稱（日文/英文）：{title}
-商品說明：{description[:1500] if description else ''}
+商品說明：{description[:1500] if description else ''}{size_spec_section}
 
 請回傳 JSON 格式（不要加 markdown 標記）：
 {{
     "title": "翻譯後的商品名稱（繁體中文或英文，簡潔有力，前面加上 BAPE）",
     "description": "翻譯後的商品說明（繁體中文，保留原意但更流暢，適合電商展示，每個重點用 <br> 換行）",
+    "size_spec_translated": "翻譯後的尺寸規格（如果有的話，把日文欄位名稱翻譯成中文，例如：サイズ→尺寸、着丈→衣長、身幅→身寬、肩幅→肩寬、袖丈→袖長，格式保持：列1|列2|列3...，每行用換行分隔）",
     "page_title": "SEO 頁面標題（繁體中文，包含品牌和商品特色，50-60字以內）",
     "meta_description": "SEO 描述（繁體中文，吸引點擊，包含關鍵字，100字以內）"
 }}
@@ -170,7 +177,7 @@ def translate_with_chatgpt(title, description):
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0,
-                "max_tokens": 1000
+                "max_tokens": 1500
             },
             timeout=60
         )
@@ -190,6 +197,7 @@ def translate_with_chatgpt(title, description):
             
             trans_title = translated.get('title', title)
             trans_desc = translated.get('description', description)
+            trans_size_spec = translated.get('size_spec_translated', '')
             trans_page_title = translated.get('page_title', '')
             trans_meta_desc = translated.get('meta_description', '')
             
@@ -200,6 +208,9 @@ def translate_with_chatgpt(title, description):
             if contains_japanese(trans_desc):
                 print(f"[警告] 描述包含日文，正在移除")
                 trans_desc = remove_japanese(trans_desc)
+            if contains_japanese(trans_size_spec):
+                print(f"[警告] 尺寸規格包含日文，正在移除")
+                trans_size_spec = remove_japanese(trans_size_spec)
             if contains_japanese(trans_page_title):
                 trans_page_title = remove_japanese(trans_page_title)
             if contains_japanese(trans_meta_desc):
@@ -208,10 +219,16 @@ def translate_with_chatgpt(title, description):
             if not trans_title.startswith('BAPE'):
                 trans_title = f"BAPE {trans_title}"
             
+            # 建立尺寸表 HTML
+            size_spec_html = ''
+            if trans_size_spec:
+                size_spec_html = build_size_table_html(trans_size_spec)
+            
             return {
                 'success': True,
                 'title': trans_title,
                 'description': trans_desc,
+                'size_spec_html': size_spec_html,
                 'page_title': trans_page_title,
                 'meta_description': trans_meta_desc
             }
@@ -221,6 +238,7 @@ def translate_with_chatgpt(title, description):
                 'success': False,
                 'title': f"BAPE {title}",
                 'description': description,
+                'size_spec_html': '',
                 'page_title': '',
                 'meta_description': ''
             }
@@ -231,9 +249,47 @@ def translate_with_chatgpt(title, description):
             'success': False,
             'title': f"BAPE {title}",
             'description': description,
+            'size_spec_html': '',
             'page_title': '',
             'meta_description': ''
         }
+
+
+def build_size_table_html(size_spec_text):
+    """將翻譯後的尺寸規格文字轉換成 HTML 表格"""
+    if not size_spec_text:
+        return ''
+    
+    lines = [line.strip() for line in size_spec_text.strip().split('\n') if line.strip()]
+    if not lines:
+        return ''
+    
+    html = '<div class="size-spec"><h3>📏 尺寸規格</h3>'
+    html += '<table style="border-collapse: collapse; width: 100%; margin: 10px 0;">'
+    
+    for i, line in enumerate(lines):
+        cells = [cell.strip() for cell in line.split('|')]
+        if i == 0:
+            # 第一行是標題
+            html += '<tr style="background-color: #f5f5f5;">'
+            for cell in cells:
+                html += f'<th style="border: 1px solid #ddd; padding: 8px; text-align: center;">{cell}</th>'
+            html += '</tr>'
+        else:
+            html += '<tr>'
+            for j, cell in enumerate(cells):
+                if j == 0:
+                    # 第一列是標題
+                    html += f'<td style="border: 1px solid #ddd; padding: 8px; font-weight: bold; background-color: #fafafa;">{cell}</td>'
+                else:
+                    html += f'<td style="border: 1px solid #ddd; padding: 8px; text-align: center;">{cell}</td>'
+            html += '</tr>'
+    
+    html += '</table>'
+    html += '<p style="font-size: 12px; color: #666;">※ 單位為 cm，尺寸可能因商品而有些許誤差</p>'
+    html += '</div>'
+    
+    return html
 
 
 def download_image_to_base64(img_url, max_retries=3):
@@ -567,6 +623,62 @@ def check_product_stock(product):
     return False
 
 
+def fetch_size_table(handle):
+    """從商品頁面 HTML 取得尺寸表"""
+    try:
+        url = f"{SOURCE_URL}/products/{handle}"
+        print(f"[尺寸表] 正在取得: {url}")
+        
+        response = requests.get(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html',
+        }, timeout=30)
+        
+        if response.status_code != 200:
+            print(f"[尺寸表] HTTP {response.status_code}")
+            return None
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 找尺寸表 - 在 s-product-detail__def-list-description 裡面
+        def_list = soup.find('dl', class_='s-product-detail__def-list-description')
+        if not def_list:
+            print(f"[尺寸表] 未找到 def-list")
+            return None
+        
+        # 找 <dt>サイズ</dt> 後面的 <dd>
+        size_dt = def_list.find('dt', string=re.compile(r'サイズ'))
+        if not size_dt:
+            print(f"[尺寸表] 未找到サイズ")
+            return None
+        
+        size_dd = size_dt.find_next_sibling('dd')
+        if not size_dd:
+            print(f"[尺寸表] 未找到 dd")
+            return None
+        
+        # 找表格
+        table = size_dd.find('table')
+        if not table:
+            print(f"[尺寸表] 未找到 table")
+            return None
+        
+        # 提取表格純文字（用於翻譯）
+        rows = table.find_all('tr')
+        size_spec_text = ''
+        for row in rows:
+            cells = row.find_all(['th', 'td'])
+            row_text = ' | '.join([cell.get_text(strip=True) for cell in cells])
+            size_spec_text += row_text + '\n'
+        
+        print(f"[尺寸表] 找到 {len(rows)} 行")
+        return size_spec_text
+        
+    except Exception as e:
+        print(f"[尺寸表] 錯誤: {e}")
+        return None
+
+
 def update_product_prices(source_product, existing_product_info):
     """比對並更新商品價格（官網價格 vs Shopify 成本價）"""
     product_id = existing_product_info['product_id']
@@ -631,13 +743,22 @@ def upload_to_shopify(source_product, collection_id=None):
     body_html = source_product.get('body_html', '')
     handle = source_product.get('handle', '')
     
+    # 取得尺寸表
+    size_spec = fetch_size_table(handle)
+    
     print(f"[翻譯] 正在翻譯: {original_title[:30]}...")
-    translated = translate_with_chatgpt(original_title, body_html)
+    translated = translate_with_chatgpt(original_title, body_html, size_spec or '')
     
     if translated['success']:
         print(f"[翻譯成功] {translated['title'][:30]}...")
     else:
         print(f"[翻譯失敗] 使用原文")
+    
+    # 組合商品說明和尺寸表
+    final_body_html = translated['description']
+    if translated.get('size_spec_html'):
+        final_body_html += '<br><br>' + translated['size_spec_html']
+        print(f"[尺寸表] 已加入商品說明")
     
     # 處理選項（Options）
     options = []
@@ -732,7 +853,7 @@ def upload_to_shopify(source_product, collection_id=None):
     shopify_product = {
         'product': {
             'title': translated['title'],
-            'body_html': translated['description'],
+            'body_html': final_body_html,  # 包含商品說明 + 尺寸表
             'vendor': 'BAPE',
             'product_type': source_product.get('product_type', ''),
             'status': 'active',

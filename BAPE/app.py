@@ -101,6 +101,32 @@ def calculate_selling_price(cost, weight):
     return round(price)
 
 
+def contains_japanese(text):
+    """檢測文字是否包含日文（平假名、片假名）"""
+    if not text:
+        return False
+    import re
+    # 平假名: \u3040-\u309F, 片假名: \u30A0-\u30FF
+    japanese_pattern = re.compile(r'[\u3040-\u309F\u30A0-\u30FF]')
+    return bool(japanese_pattern.search(text))
+
+
+def remove_japanese(text):
+    """移除文字中的日文字元"""
+    if not text:
+        return text
+    import re
+    # 移除平假名、片假名
+    cleaned = re.sub(r'[\u3040-\u309F\u30A0-\u30FF]+', '', text)
+    # 清理多餘空格
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    # 清理多餘的標點
+    cleaned = re.sub(r'[（）\(\)]\s*[（）\(\)]', '', cleaned)
+    cleaned = re.sub(r'\s*[/／]\s*$', '', cleaned)
+    cleaned = re.sub(r'^\s*[/／]\s*', '', cleaned)
+    return cleaned
+
+
 def translate_with_chatgpt(title, description):
     prompt = f"""你是專業的日本商品翻譯和 SEO 專家。請將以下日本服飾品牌商品資訊翻譯成繁體中文，並優化 SEO。
 
@@ -115,14 +141,20 @@ def translate_with_chatgpt(title, description):
     "meta_description": "SEO 描述（繁體中文，吸引點擊，包含關鍵字，100字以內）"
 }}
 
-重要規則：
+【最重要規則 - 絕對禁止日文】：
+- 禁止出現任何平假名（あいうえお等）
+- 禁止出現任何片假名（アイウエオ等）
+- 如果原文有日文，必須翻譯成繁體中文
+- 如果無法翻譯，直接省略該部分
+- 違反此規則是嚴重錯誤
+
+其他規則：
 1. 這是日本潮流品牌 A BATHING APE (BAPE) 的商品
 2. 商品名稱如果是英文可以保留英文，但開頭必須是「BAPE」
 3. 翻譯要自然流暢，不要生硬
-4. 【禁止使用任何日文】所有內容必須是繁體中文或英文
-5. SEO 內容要包含：BAPE、A BATHING APE、日本、潮流、服飾等關鍵字
-6. description 中每個重點用 <br> 換行，方便閱讀
-7. 只回傳 JSON，不要其他文字"""
+4. SEO 內容要包含：BAPE、A BATHING APE、日本、潮流、服飾等關鍵字
+5. description 中每個重點用 <br> 換行，方便閱讀
+6. 只回傳 JSON，不要其他文字"""
 
     try:
         response = requests.post(
@@ -134,7 +166,7 @@ def translate_with_chatgpt(title, description):
             json={
                 "model": "gpt-4o-mini",
                 "messages": [
-                    {"role": "system", "content": "你是專業的日本商品翻譯和 SEO 專家。你的輸出必須完全使用繁體中文和英文，絕對禁止出現任何日文字元。"},
+                    {"role": "system", "content": "你是專業的日本商品翻譯和 SEO 專家。【最高優先規則】你的輸出絕對禁止出現任何日文字元（平假名、片假名）。所有內容必須是繁體中文或英文。"},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0,
@@ -157,15 +189,31 @@ def translate_with_chatgpt(title, description):
             translated = json.loads(content)
             
             trans_title = translated.get('title', title)
+            trans_desc = translated.get('description', description)
+            trans_page_title = translated.get('page_title', '')
+            trans_meta_desc = translated.get('meta_description', '')
+            
+            # 檢查並移除日文
+            if contains_japanese(trans_title):
+                print(f"[警告] 標題包含日文，正在移除: {trans_title}")
+                trans_title = remove_japanese(trans_title)
+            if contains_japanese(trans_desc):
+                print(f"[警告] 描述包含日文，正在移除")
+                trans_desc = remove_japanese(trans_desc)
+            if contains_japanese(trans_page_title):
+                trans_page_title = remove_japanese(trans_page_title)
+            if contains_japanese(trans_meta_desc):
+                trans_meta_desc = remove_japanese(trans_meta_desc)
+            
             if not trans_title.startswith('BAPE'):
                 trans_title = f"BAPE {trans_title}"
             
             return {
                 'success': True,
                 'title': trans_title,
-                'description': translated.get('description', description),
-                'page_title': translated.get('page_title', ''),
-                'meta_description': translated.get('meta_description', '')
+                'description': trans_desc,
+                'page_title': trans_page_title,
+                'meta_description': trans_meta_desc
             }
         else:
             print(f"[OpenAI 錯誤] {response.status_code}: {response.text}")

@@ -259,13 +259,16 @@ def fetch_all_product_links(category_key):
             response = requests.get(page_url, headers=HEADERS, timeout=30)
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
-                product_links = soup.find_all('a', class_='block-link')
-                for link in product_links:
+                
+                # 找所有連結，篩選出商品連結 (/shop/g/)
+                for link in soup.find_all('a', href=True):
                     href = link.get('href', '')
                     if '/shop/g/' in href:
                         full_url = SOURCE_URL + href if href.startswith('/') else href
                         if full_url not in all_links:
                             all_links.append(full_url)
+                            
+                print(f"[INFO] 第 {page} 頁找到 {len(all_links)} 個商品連結")
         except Exception as e:
             print(f"[ERROR] 頁面 {page} 載入失敗: {e}")
         
@@ -1478,15 +1481,19 @@ def api_test_workman():
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
-            product_links = soup.find_all('a', class_='block-link')
-            results['kids_page']['product_links_found'] = len(product_links)
             
-            # 檢查有多少是商品連結
-            goods_links = [l for l in product_links if '/shop/g/' in l.get('href', '')]
+            # 找所有連結，篩選出商品連結 (/shop/g/)
+            goods_links = []
+            for link in soup.find_all('a', href=True):
+                href = link.get('href', '')
+                if '/shop/g/' in href and href not in [l.get('href') for l in goods_links]:
+                    goods_links.append(link)
+            
             results['kids_page']['goods_links_found'] = len(goods_links)
             
             if goods_links:
                 results['kids_page']['first_link'] = goods_links[0].get('href', '')
+                results['kids_page']['sample_links'] = [l.get('href', '') for l in goods_links[:5]]
     except Exception as e:
         results['kids_page'] = {'error': str(e), 'ok': False}
     

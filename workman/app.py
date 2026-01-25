@@ -1097,9 +1097,9 @@ def publish_product_to_all_channels(product_id):
 def batch_publish_workman_products():
     """批量發布所有 WORKMAN 商品到所有銷售管道"""
     # 取得所有 WORKMAN 商品
-    product_ids = fetch_workman_product_ids()
+    products = fetch_workman_product_ids()
     
-    if not product_ids:
+    if not products:
         return {'success': False, 'error': 'No WORKMAN products found'}
     
     # 取得所有銷售管道
@@ -1110,14 +1110,18 @@ def batch_publish_workman_products():
     
     publication_inputs = [{"publicationId": pub['id']} for pub in publications]
     
+    print(f"[Publish] 準備發布 {len(products)} 個商品到 {len(publications)} 個銷售管道")
+    
     results = {
-        'total': len(product_ids),
+        'total': len(products),
         'success': 0,
         'failed': 0,
         'errors': []
     }
     
-    for product_id in product_ids:
+    for product in products:
+        product_id = product['id']  # 修正：從 dict 取出 ID
+        
         mutation = """
         mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
           publishablePublish(id: $id, input: $input) {
@@ -1134,12 +1138,15 @@ def batch_publish_workman_products():
         user_errors = result.get('data', {}).get('publishablePublish', {}).get('userErrors', [])
         if user_errors:
             results['failed'] += 1
-            results['errors'].append({'id': product_id, 'errors': user_errors})
+            results['errors'].append({'id': product_id, 'title': product.get('title', ''), 'errors': user_errors})
+            print(f"[Publish] ❌ {product.get('title', '')[:20]}: {user_errors}")
         else:
             results['success'] += 1
+            print(f"[Publish] ✓ {product.get('title', '')[:30]}")
         
         time.sleep(0.1)  # 避免 rate limit
     
+    print(f"[Publish] 完成！成功: {results['success']}, 失敗: {results['failed']}")
     return results
 
 
@@ -1896,7 +1903,7 @@ def index():
                         // 自動發布
                         if (document.getElementById('autoPublish') && document.getElementById('autoPublish').checked) {
                             log('📢 自動發布到所有銷售管道...');
-                            publishAll();
+                            publishAll(true);  // true = 自動模式，不跳確認
                         } else {
                             log('⚠️ 請點擊「📢 發布所有 WORKMAN 商品」按鈕來開啟銷售管道');
                         }
@@ -1934,7 +1941,7 @@ def index():
                         log('✅ 批量上傳已完成！');
                         if (document.getElementById('autoPublish') && document.getElementById('autoPublish').checked) {
                             log('📢 自動發布中...');
-                            publishAll();
+                            publishAll(true);  // true = 自動模式，不跳確認
                         } else {
                             log('⚠️ 請點擊「📢 發布所有 WORKMAN 商品」按鈕來開啟銷售管道');
                         }
@@ -2014,8 +2021,8 @@ def index():
                 });
         }
         
-        function publishAll() {
-            if (!confirm('確定要發布所有 WORKMAN 商品到所有銷售管道？')) return;
+        function publishAll(autoMode = false) {
+            if (!autoMode && !confirm('確定要發布所有 WORKMAN 商品到所有銷售管道？')) return;
             
             log('📢 正在發布商品到所有銷售管道...');
             document.getElementById('status').textContent = '正在發布商品...';
@@ -2026,7 +2033,7 @@ def index():
                     if (data.error) {
                         log('❌ 錯誤: ' + data.error);
                     } else {
-                        log(`📢 發布完成！成功: ${data.success}, 失敗: ${data.failed}`);
+                        log(`📢 發布完成！成功: ${data.success}, 失敗: ${data.failed}, 總計: ${data.total}`);
                         if (data.errors && data.errors.length > 0) {
                             log('錯誤詳情: ' + JSON.stringify(data.errors.slice(0, 3)));
                         }

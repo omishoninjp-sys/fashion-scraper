@@ -638,9 +638,6 @@ def product_to_jsonl_entry(product, category_key, collection_id, existing_produc
         "status": "ACTIVE",
         "handle": f"bape-{handle}",
         "tags": cat_info['tags'],
-        "productCategory": {
-            "productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/1"  # Apparel & Accessories
-        },
         "seo": {"title": seo_title, "description": seo_description},
         "metafields": [{"namespace": "custom", "key": "link", "value": source_url, "type": "url"}]
     }

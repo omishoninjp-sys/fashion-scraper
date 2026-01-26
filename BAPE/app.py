@@ -1734,6 +1734,141 @@ def api_count():
     return jsonify({'count': result.get('data', {}).get('productsCount', {}).get('count', 0)})
 
 
+@app.route('/api/check_bulk_result')
+def api_check_bulk_result():
+    """檢查最近的 Bulk Operation 結果"""
+    try:
+        # 查詢最近的 Bulk Operation
+        query = """query {
+            currentBulkOperation(type: MUTATION) {
+                id
+                status
+                errorCode
+                createdAt
+                completedAt
+                objectCount
+                fileSize
+                url
+                partialDataUrl
+            }
+        }"""
+        
+        result = graphql_request(query)
+        bulk_op = result.get('data', {}).get('currentBulkOperation')
+        
+        if not bulk_op:
+            # 嘗試查詢歷史記錄
+            history_query = """query {
+                bulkOperations(first: 5, type: MUTATION) {
+                    edges {
+                        node {
+                            id
+                            status
+                            errorCode
+                            createdAt
+                            completedAt
+                            objectCount
+                            fileSize
+                            url
+                            rootObjectCount
+                        }
+                    }
+                }
+            }"""
+            history_result = graphql_request(history_query)
+            return jsonify({
+                'current': None,
+                'history': history_result
+            })
+        
+        response = {'bulk_operation': bulk_op}
+        
+        # 如果有結果文件，嘗試下載
+        if bulk_op.get('url'):
+            try:
+                file_response = requests.get(bulk_op['url'], timeout=30)
+                if file_response.status_code == 200:
+                    # 只取前 5000 字元
+                    response['result_content'] = file_response.text[:5000]
+            except Exception as e:
+                response['result_error'] = str(e)
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
+
+
+@app.route('/api/test_single_upload')
+def api_test_single_upload():
+    """測試單一商品上傳（不使用 Bulk Operation）"""
+    try:
+        # 取得一個商品
+        products = fetch_products_json(1)
+        if not products:
+            return jsonify({'error': '無法取得商品'})
+        
+        # 找一個有庫存的商品
+        test_product = None
+        for p in products:
+            has_stock = any(v.get('available', False) for v in p.get('variants', []))
+            if has_stock:
+                test_product = p
+                break
+        
+        if not test_product:
+            return jsonify({'error': '沒有有庫存的商品'})
+        
+        # 取得 Collection
+        collection_id = get_or_create_collection("BAPE Men's")
+        if not collection_id:
+            return jsonify({'error': '無法取得 Collection'})
+        
+        # 轉換商品
+        entry = product_to_jsonl_entry(test_product, 'mens', collection_id, None)
+        if not entry:
+            return jsonify({'error': '商品轉換失敗'})
+        
+        product_input = entry['productSet']
+        
+        # 直接使用 productSet mutation（同步模式）
+        mutation = """mutation productSet($input: ProductSetInput!, $synchronous: Boolean!) {
+            productSet(synchronous: $synchronous, input: $input) {
+                product {
+                    id
+                    title
+                    handle
+                    status
+                }
+                userErrors {
+                    field
+                    code
+                    message
+                }
+            }
+        }"""
+        
+        result = graphql_request(mutation, {"input": product_input, "synchronous": True})
+        
+        return jsonify({
+            'product_input': {
+                'title': product_input.get('title'),
+                'handle': product_input.get('handle'),
+                'vendor': product_input.get('vendor'),
+                'status': product_input.get('status'),
+                'variants_count': len(product_input.get('variants', [])),
+                'has_productCategory': 'productCategory' in product_input,
+                'collections': product_input.get('collections')
+            },
+            'result': result
+        })
+        
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
+
+
 @app.route('/api/check_taxonomy')
 def api_check_taxonomy():
     """查詢 Shopify 商品分類 ID"""

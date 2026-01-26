@@ -2683,8 +2683,8 @@ def api_cron():
             'valid_categories': valid_categories
         })
     
-    # 在背景執行完整同步
-    thread = threading.Thread(target=run_full_sync, args=(category,))
+    # 在背景執行完整同步（使用 daemon=False 確保線程不會被中斷）
+    thread = threading.Thread(target=run_full_sync, args=(category,), daemon=False)
     thread.start()
     
     return jsonify({
@@ -2783,15 +2783,34 @@ def api_delete():
 
 @app.route('/api/publish_all')
 def api_publish_all():
-    """批量發布所有 WORKMAN 商品到所有銷售管道"""
-    if scrape_status['running']:
+    """批量發布所有 WORKMAN 商品到所有銷售管道（背景執行）"""
+    if scrape_status.get('running', False):
         return jsonify({'error': '正在執行中'})
     
-    try:
-        results = batch_publish_workman_products()
-        return jsonify(results)
-    except Exception as e:
-        return jsonify({'error': str(e)})
+    def run_publish():
+        global scrape_status
+        scrape_status['running'] = True
+        scrape_status['phase'] = 'publishing'
+        scrape_status['current_product'] = '正在發布到銷售管道...'
+        
+        try:
+            results = batch_publish_workman_products()
+            scrape_status['current_product'] = f"發布完成！成功: {results.get('success', 0)}, 失敗: {results.get('failed', 0)}"
+            scrape_status['publish_result'] = results
+        except Exception as e:
+            scrape_status['current_product'] = f"發布失敗: {str(e)}"
+            scrape_status['errors'].append({'error': str(e)})
+        finally:
+            scrape_status['running'] = False
+            scrape_status['phase'] = 'idle'
+    
+    thread = threading.Thread(target=run_publish, daemon=False)
+    thread.start()
+    
+    return jsonify({
+        'success': True,
+        'message': '已開始背景發布，請透過 /api/status 查看進度'
+    })
 
 
 @app.route('/api/publications')

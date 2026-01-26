@@ -641,13 +641,26 @@ def run_test_single(category='mens'):
     
     try:
         cat_info = CATEGORIES[category]
+        print(f"[TEST] 分類: {category}, Collection: {cat_info['collection']}")
+        
+        scrape_status['current_product'] = f"取得 Collection..."
         collection_id = get_or_create_collection(cat_info['collection'])
+        print(f"[TEST] Collection ID: {collection_id}")
         
         if not collection_id:
             scrape_status['errors'].append({'error': '無法建立 Collection'})
+            scrape_status['current_product'] = '❌ 無法建立 Collection'
             return
         
+        scrape_status['current_product'] = f"爬取商品..."
         products = fetch_category_products_json(category, 1)
+        print(f"[TEST] 取得 {len(products)} 個商品")
+        
+        if not products:
+            scrape_status['errors'].append({'error': '無法取得商品，請檢查網路連線'})
+            scrape_status['current_product'] = '❌ 無法取得商品'
+            return
+        
         test_product = None
         for p in products:
             if any(v.get('available', False) for v in p.get('variants', [])):
@@ -656,29 +669,57 @@ def run_test_single(category='mens'):
                     break
         
         if not test_product:
-            scrape_status['errors'].append({'error': '沒有符合條件的商品'})
+            scrape_status['errors'].append({'error': f'沒有符合條件的商品（價格 >= {MIN_PRICE}）'})
+            scrape_status['current_product'] = '❌ 沒有符合條件的商品'
             return
+        
+        print(f"[TEST] 測試商品: {test_product.get('title', '')[:50]}")
         
         scrape_status['current_product'] = f"翻譯: {test_product['title'][:30]}..."
         entry = product_to_jsonl_entry(test_product, category, collection_id)
         
         if not entry:
-            scrape_status['errors'].append({'error': '商品轉換失敗'})
+            scrape_status['errors'].append({'error': '商品轉換失敗（可能沒有有效的 variant）'})
+            scrape_status['current_product'] = '❌ 商品轉換失敗'
             return
         
         product_input = entry['productSet']
+        print(f"[TEST] 轉換成功: {product_input['title']}")
+        print(f"[TEST] Variants: {len(product_input.get('variants', []))}")
+        
         scrape_status['products'].append({'title': product_input['title'], 'handle': product_input['handle'], 'variants': len(product_input.get('variants', []))})
         
         scrape_status['current_product'] = "上傳到 Shopify..."
         mutation = """mutation productSet($input: ProductSetInput!, $synchronous: Boolean!) { productSet(synchronous: $synchronous, input: $input) { product { id title handle } userErrors { field code message } } }"""
+        
+        # 除錯：打印完整的 product_input
+        print(f"[TEST] ===== ProductSet Input =====")
+        print(f"[TEST] title: {product_input.get('title')}")
+        print(f"[TEST] handle: {product_input.get('handle')}")
+        print(f"[TEST] vendor: {product_input.get('vendor')}")
+        print(f"[TEST] productType: {product_input.get('productType')}")
+        print(f"[TEST] productOptions: {product_input.get('productOptions')}")
+        print(f"[TEST] variants count: {len(product_input.get('variants', []))}")
+        if product_input.get('variants'):
+            print(f"[TEST] first variant: {product_input['variants'][0]}")
+        print(f"[TEST] collections: {product_input.get('collections')}")
+        print(f"[TEST] ================================")
+        
         result = graphql_request(mutation, {"input": product_input, "synchronous": True})
+        
+        # 除錯：打印完整回應
+        print(f"[TEST] ===== GraphQL Response =====")
+        print(f"[TEST] {json.dumps(result, ensure_ascii=False, indent=2)[:2000]}")
+        print(f"[TEST] ================================")
         
         product_set = result.get('data', {}).get('productSet', {})
         user_errors = product_set.get('userErrors', [])
         
         if user_errors:
-            scrape_status['errors'].append({'error': '; '.join([e.get('message', str(e)) for e in user_errors])})
-            scrape_status['current_product'] = f"❌ 失敗"
+            error_msg = '; '.join([e.get('message', str(e)) for e in user_errors])
+            scrape_status['errors'].append({'error': error_msg})
+            scrape_status['current_product'] = f"❌ 失敗: {error_msg}"
+            print(f"[ERROR] productSet 失敗: {error_msg}")
         else:
             product = product_set.get('product', {})
             publications = get_all_publications()
@@ -1014,6 +1055,9 @@ def index():
                 if (!data.running) {
                     clearInterval(pollInterval);
                     if (data.phase === 'completed') log('✅ 完成！', 'success');
+                    if (data.errors && data.errors.length > 0) {
+                        data.errors.forEach(e => log('❌ ' + (e.error || JSON.stringify(e)), 'error'));
+                    }
                 }
             } catch (e) { console.error(e); }
         }

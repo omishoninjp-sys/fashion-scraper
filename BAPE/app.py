@@ -350,47 +350,61 @@ def fetch_category_products_html(category_key, page=1):
     
     try:
         response = requests.get(url, headers=HEADERS, timeout=30)
+        print(f"[爬取] HTTP 狀態: {response.status_code}")
+        
         if response.status_code != 200:
             print(f"[錯誤] HTTP {response.status_code}")
             return [], False
         
         soup = BeautifulSoup(response.text, 'html.parser')
         
+        # 除錯：顯示頁面標題
+        title_tag = soup.find('title')
+        print(f"[爬取] 頁面標題: {title_tag.get_text()[:50] if title_tag else 'N/A'}")
+        
         # 找商品連結
         product_handles = []
         
-        # 方法1: 找 product-card 連結
-        for link in soup.find_all('a', href=True):
+        # 找所有包含 /products/ 的連結
+        all_links = soup.find_all('a', href=True)
+        print(f"[爬取] 找到 {len(all_links)} 個連結")
+        
+        for link in all_links:
             href = link.get('href', '')
-            if '/products/' in href and href not in product_handles:
+            if '/products/' in href:
                 # 提取 handle
-                match = re.search(r'/products/([^/?]+)', href)
+                match = re.search(r'/products/([^/?#]+)', href)
                 if match:
                     handle = match.group(1)
-                    if handle not in product_handles:
+                    if handle not in product_handles and handle != 'products':
                         product_handles.append(handle)
         
         print(f"[爬取] 第 {page} 頁找到 {len(product_handles)} 個商品")
         
+        # 除錯：顯示前 5 個 handle
+        if product_handles:
+            print(f"[爬取] 前 5 個: {product_handles[:5]}")
+        else:
+            # 如果沒找到，顯示一些連結樣本
+            sample_links = [a.get('href', '') for a in all_links[:20]]
+            print(f"[爬取] 連結樣本: {sample_links}")
+        
         # 檢查是否有下一頁
         has_next_page = False
-        pagination = soup.find('nav', class_='pagination') or soup.find('div', class_='pagination')
-        if pagination:
-            next_link = pagination.find('a', string=re.compile(r'次|Next|›|»'))
-            if next_link:
-                has_next_page = True
         
-        # 也檢查是否有 page 參數的連結
-        if not has_next_page:
-            for link in soup.find_all('a', href=True):
-                if f'page={page + 1}' in link.get('href', ''):
-                    has_next_page = True
-                    break
+        # 檢查 pagination
+        for link in all_links:
+            href = link.get('href', '')
+            if f'page={page + 1}' in href:
+                has_next_page = True
+                break
         
         return product_handles, has_next_page
         
     except Exception as e:
         print(f"[錯誤] {e}")
+        import traceback
+        traceback.print_exc()
         return [], False
 
 
@@ -1028,21 +1042,34 @@ def run_test_sync(category='all', limit=10):
         if not categories_to_scrape:
             raise Exception(f'未知分類: {category}')
         
+        print(f"[TEST SYNC] 要爬取的分類: {categories_to_scrape}")
+        
         all_jsonl_entries = []
         
         for cat_key in categories_to_scrape:
             cat_info = CATEGORIES[cat_key]
             scrape_status['current_product'] = f"爬取 {cat_info['collection']} (限 {limit} 個)..."
+            print(f"[TEST SYNC] 開始爬取 {cat_info['collection']}...")
             
             collection_id = get_or_create_collection(cat_info['collection'])
             if not collection_id:
+                print(f"[TEST SYNC] 無法取得 Collection: {cat_info['collection']}")
+                scrape_status['errors'].append({'error': f"無法取得 Collection: {cat_info['collection']}"})
                 continue
+            
+            print(f"[TEST SYNC] Collection ID: {collection_id}")
             
             # 只取第一頁的 handle，限制數量
             handles, _ = fetch_category_products_html(cat_key, 1)
-            handles = handles[:limit]  # 限制數量
+            print(f"[TEST SYNC] 取得 {len(handles)} 個 handle")
             
-            print(f"[TEST SYNC] {cat_info['collection']} 取 {len(handles)} 個商品")
+            if not handles:
+                print(f"[TEST SYNC] {cat_info['collection']} 沒有找到商品")
+                scrape_status['errors'].append({'error': f"{cat_info['collection']} 沒有找到商品"})
+                continue
+            
+            handles = handles[:limit]  # 限制數量
+            print(f"[TEST SYNC] 限制後: {len(handles)} 個")
             
             scrape_status['total'] += len(handles)
             
@@ -1050,12 +1077,15 @@ def run_test_sync(category='all', limit=10):
                 scrape_status['progress'] += 1
                 scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {handle[:30]}"
                 
+                print(f"[TEST SYNC] 取得商品 JSON: {handle}")
                 product = fetch_product_json(handle)
                 if not product:
+                    print(f"[TEST SYNC] 無法取得商品: {handle}")
                     continue
                 
                 has_stock = any(v.get('available', False) for v in product.get('variants', []))
                 if not has_stock:
+                    print(f"[TEST SYNC] 無庫存: {handle}")
                     continue
                 
                 my_handle = f"bape-{handle}"
@@ -1071,10 +1101,14 @@ def run_test_sync(category='all', limit=10):
                             'handle': entry['productSet']['handle'],
                             'variants': len(entry['productSet'].get('variants', []))
                         })
+                        print(f"[TEST SYNC] 已加入: {entry['productSet']['title'][:30]}")
                 except Exception as e:
+                    print(f"[TEST SYNC] 轉換失敗: {e}")
                     scrape_status['errors'].append({'error': str(e)})
                 
                 time.sleep(0.5)
+        
+        print(f"[TEST SYNC] 總共 {len(all_jsonl_entries)} 個商品")
         
         if not all_jsonl_entries:
             raise Exception('沒有爬取到商品')
@@ -1085,6 +1119,7 @@ def run_test_sync(category='all', limit=10):
             for entry in all_jsonl_entries:
                 f.write(json.dumps(entry, ensure_ascii=False) + '\n')
         scrape_status['jsonl_file'] = jsonl_path
+        print(f"[TEST SYNC] JSONL: {jsonl_path}")
         
         # 批量上傳
         print(f"[TEST SYNC] 批量上傳 {len(all_jsonl_entries)} 個商品...")

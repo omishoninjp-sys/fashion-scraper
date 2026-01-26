@@ -205,10 +205,10 @@ def remove_japanese(text):
 
 def translate_with_chatgpt(title, description, size_spec=''):
     if not OPENAI_API_KEY:
-        print(f"[翻譯] OPENAI_API_KEY 未設定，跳過翻譯: {title[:30]}")
+        print(f"[翻譯] OPENAI_API_KEY 未設定，跳過翻譯: {title[:30]}", flush=True)
         return {'success': False, 'title': f"BAPE {title}", 'description': description}
     
-    print(f"[翻譯] 開始: {title[:40]}...")
+    print(f"[翻譯] 開始: {title[:40]}...", flush=True)
     
     size_spec_section = f"\n尺寸規格表：\n{size_spec}" if size_spec else ""
     
@@ -248,7 +248,7 @@ def translate_with_chatgpt(title, description, size_spec=''):
             timeout=60
         )
         
-        print(f"[翻譯] API 回應狀態: {response.status_code}")
+        print(f"[翻譯] API 回應狀態: {response.status_code}", flush=True)
         
         if response.status_code == 200:
             content = response.json()['choices'][0]['message']['content'].strip()
@@ -348,22 +348,22 @@ def fetch_products_json(page=1):
     """從 BAPE 網站取得所有商品（JSON API）"""
     url = f"{SOURCE_URL}/collections/all/products.json?page={page}&limit=50"
     
-    print(f"[爬取] 第 {page} 頁: {url}")
+    print(f"[爬取] 第 {page} 頁: {url}", flush=True)
     
     try:
         response = requests.get(url, headers=HEADERS, timeout=30)
-        print(f"[爬取] HTTP 狀態: {response.status_code}")
+        print(f"[爬取] HTTP 狀態: {response.status_code}", flush=True)
         
         if response.status_code != 200:
             return []
         
         data = response.json()
         products = data.get('products', [])
-        print(f"[爬取] 第 {page} 頁取得 {len(products)} 個商品")
+        print(f"[爬取] 第 {page} 頁取得 {len(products)} 個商品", flush=True)
         return products
         
     except Exception as e:
-        print(f"[錯誤] {e}")
+        print(f"[錯誤] {e}", flush=True)
         import traceback
         traceback.print_exc()
         return []
@@ -1060,7 +1060,7 @@ def run_test_sync(category='all', limit=10):
     """測試上架（每個分類只抓 limit 個商品）"""
     global scrape_status
     
-    print(f"[TEST SYNC] ========== 測試上架 (每分類 {limit} 個) ==========")
+    print(f"[TEST SYNC] ========== 測試上架 (每分類 {limit} 個) ==========", flush=True)
     
     scrape_status = {"running": True, "phase": "test_sync", "progress": 0, "total": 0, "current_product": "開始測試上架...", "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "set_to_draft": 0}
     
@@ -1069,11 +1069,37 @@ def run_test_sync(category='all', limit=10):
         scrape_status['current_product'] = '取得現有商品...'
         existing_products = fetch_bape_product_ids()
         existing_handles = {p['handle']: p for p in existing_products}
-        print(f"[TEST SYNC] 現有 {len(existing_handles)} 個商品")
+        print(f"[TEST SYNC] 現有 {len(existing_handles)} 個商品", flush=True)
         
-        # 取得所有商品並分類
-        scrape_status['current_product'] = '爬取商品...'
-        all_by_category = fetch_all_products_by_category()
+        # 只爬取前幾頁（測試用，不需要全部）
+        scrape_status['current_product'] = '爬取商品（測試模式）...'
+        print(f"[TEST SYNC] 爬取商品（測試模式，只爬前 3 頁）...", flush=True)
+        
+        all_products_by_cat = {'mens': [], 'womens': [], 'kids': []}
+        
+        # 只爬取前 3 頁，足夠取得每分類 10 個商品
+        for page in range(1, 4):
+            products = fetch_products_json(page)
+            if not products:
+                break
+            
+            for p in products:
+                has_stock = any(v.get('available', False) for v in p.get('variants', []))
+                if not has_stock:
+                    continue
+                
+                cat = get_product_category(p)
+                if len(all_products_by_cat[cat]) < limit:
+                    all_products_by_cat[cat].append(p)
+            
+            # 檢查是否已經收集夠了
+            all_full = all(len(v) >= limit for v in all_products_by_cat.values())
+            if all_full:
+                break
+            
+            time.sleep(0.3)
+        
+        print(f"[TEST SYNC] 收集結果: 男裝 {len(all_products_by_cat['mens'])}, 女裝 {len(all_products_by_cat['womens'])}, 童裝 {len(all_products_by_cat['kids'])}", flush=True)
         
         categories_to_scrape = ['mens', 'womens', 'kids'] if category == 'all' else [category] if category in CATEGORIES else []
         if not categories_to_scrape:
@@ -1083,16 +1109,16 @@ def run_test_sync(category='all', limit=10):
         
         for cat_key in categories_to_scrape:
             cat_info = CATEGORIES[cat_key]
-            scrape_status['current_product'] = f"處理 {cat_info['collection']} (限 {limit} 個)..."
+            scrape_status['current_product'] = f"處理 {cat_info['collection']}..."
+            print(f"[TEST SYNC] 處理 {cat_info['collection']}...", flush=True)
             
             collection_id = get_or_create_collection(cat_info['collection'])
             if not collection_id:
                 scrape_status['errors'].append({'error': f"無法取得 Collection: {cat_info['collection']}"})
                 continue
             
-            # 取得該分類的商品，限制數量
-            products = all_by_category.get(cat_key, [])[:limit]
-            print(f"[TEST SYNC] {cat_info['collection']} 取 {len(products)} 個商品")
+            products = all_products_by_cat.get(cat_key, [])[:limit]
+            print(f"[TEST SYNC] {cat_info['collection']} 取 {len(products)} 個商品", flush=True)
             
             if not products:
                 scrape_status['errors'].append({'error': f"{cat_info['collection']} 沒有找到商品"})
@@ -1103,14 +1129,15 @@ def run_test_sync(category='all', limit=10):
             for product in products:
                 scrape_status['progress'] += 1
                 handle = product.get('handle', '')
-                scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {product.get('title', '')[:30]}"
+                title = product.get('title', '')[:30]
+                scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {title}"
                 
                 my_handle = f"bape-{handle}"
                 existing_info = existing_handles.get(my_handle)
                 existing_id = existing_info['id'] if existing_info else None
                 
                 try:
-                    print(f"[TEST SYNC] 開始轉換: {product.get('title', '')[:30]}")
+                    print(f"[TEST SYNC] 開始轉換: {title}", flush=True)
                     entry = product_to_jsonl_entry(product, cat_key, collection_id, existing_id)
                     if entry:
                         all_jsonl_entries.append(entry)
@@ -1119,91 +1146,93 @@ def run_test_sync(category='all', limit=10):
                             'handle': entry['productSet']['handle'],
                             'variants': len(entry['productSet'].get('variants', []))
                         })
-                        print(f"[TEST SYNC] 已加入: {entry['productSet']['title'][:30]}")
+                        print(f"[TEST SYNC] 已加入: {entry['productSet']['title'][:30]}", flush=True)
                     else:
-                        print(f"[TEST SYNC] 轉換返回 None: {product.get('title', '')[:30]}")
+                        print(f"[TEST SYNC] 轉換返回 None: {title}", flush=True)
                 except Exception as e:
-                    print(f"[TEST SYNC] 轉換失敗: {product.get('title', '')[:30]} - {e}")
+                    print(f"[TEST SYNC] 轉換失敗: {title} - {e}", flush=True)
                     import traceback
                     traceback.print_exc()
                     scrape_status['errors'].append({'error': f"轉換失敗: {str(e)}"})
                 
                 time.sleep(0.3)
         
-        print(f"[TEST SYNC] 總共 {len(all_jsonl_entries)} 個商品準備上傳")
+        print(f"[TEST SYNC] 總共 {len(all_jsonl_entries)} 個商品準備上傳", flush=True)
         
         if not all_jsonl_entries:
             raise Exception('沒有爬取到商品')
         
         # 寫入 JSONL
         jsonl_path = os.path.join(JSONL_DIR, f"bape_test_{category}_{int(time.time())}.jsonl")
-        print(f"[TEST SYNC] 寫入 JSONL: {jsonl_path}")
+        print(f"[TEST SYNC] 寫入 JSONL: {jsonl_path}", flush=True)
         with open(jsonl_path, 'w', encoding='utf-8') as f:
             for entry in all_jsonl_entries:
                 f.write(json.dumps(entry, ensure_ascii=False) + '\n')
         scrape_status['jsonl_file'] = jsonl_path
         
         # 批量上傳
-        print(f"[TEST SYNC] 開始批量上傳 {len(all_jsonl_entries)} 個商品...")
+        print(f"[TEST SYNC] 開始批量上傳 {len(all_jsonl_entries)} 個商品...", flush=True)
         scrape_status['current_product'] = '批量上傳...'
         scrape_status['phase'] = 'uploading'
         
-        print(f"[TEST SYNC] 建立 Staged Upload...")
+        print(f"[TEST SYNC] 建立 Staged Upload...", flush=True)
         staged = create_staged_upload()
         if not staged:
             raise Exception('建立 Staged Upload 失敗')
-        print(f"[TEST SYNC] Staged Upload 成功")
+        print(f"[TEST SYNC] Staged Upload 成功", flush=True)
         
-        print(f"[TEST SYNC] 上傳 JSONL 檔案...")
+        print(f"[TEST SYNC] 上傳 JSONL 檔案...", flush=True)
         if not upload_jsonl_to_staged(staged, jsonl_path):
             raise Exception('上傳 JSONL 失敗')
-        print(f"[TEST SYNC] 上傳 JSONL 成功")
+        print(f"[TEST SYNC] 上傳 JSONL 成功", flush=True)
         
         staged_path = next((p['value'] for p in staged['parameters'] if p['name'] == 'key'), '')
-        print(f"[TEST SYNC] 執行 Bulk Mutation...")
+        print(f"[TEST SYNC] 執行 Bulk Mutation...", flush=True)
         result = run_bulk_mutation(staged_path)
-        print(f"[TEST SYNC] Bulk Mutation 回應: {json.dumps(result, ensure_ascii=False)[:500]}")
+        print(f"[TEST SYNC] Bulk Mutation 回應: {json.dumps(result, ensure_ascii=False)[:500]}", flush=True)
         
         bulk_op = result.get('data', {}).get('bulkOperationRunMutation', {}).get('bulkOperation', {})
         user_errors = result.get('data', {}).get('bulkOperationRunMutation', {}).get('userErrors', [])
         if user_errors:
-            print(f"[TEST SYNC] Bulk Mutation 錯誤: {user_errors}")
+            print(f"[TEST SYNC] Bulk Mutation 錯誤: {user_errors}", flush=True)
             raise Exception(f'Bulk Mutation 錯誤: {user_errors}')
         
         scrape_status['bulk_operation_id'] = bulk_op.get('id', '')
-        print(f"[TEST SYNC] Bulk Operation ID: {bulk_op.get('id', '')}")
+        print(f"[TEST SYNC] Bulk Operation ID: {bulk_op.get('id', '')}", flush=True)
         
         # 等待完成
-        print(f"[TEST SYNC] 等待 Bulk Operation 完成...")
+        print(f"[TEST SYNC] 等待 Bulk Operation 完成...", flush=True)
         scrape_status['current_product'] = '等待完成...'
         for i in range(60):
             status = check_bulk_operation_status()
             current_status = status.get('status', '')
             scrape_status['bulk_status'] = current_status
-            print(f"[TEST SYNC] Bulk Operation 狀態 ({i+1}/60): {current_status}")
+            print(f"[TEST SYNC] Bulk Operation 狀態 ({i+1}/60): {current_status}", flush=True)
             
             if current_status == 'COMPLETED':
-                print(f"[TEST SYNC] Bulk Operation 完成！")
+                print(f"[TEST SYNC] Bulk Operation 完成！", flush=True)
                 break
             elif current_status in ['FAILED', 'CANCELED']:
                 error_code = status.get('errorCode', '')
-                print(f"[TEST SYNC] Bulk Operation 失敗: {current_status}, {error_code}")
+                print(f"[TEST SYNC] Bulk Operation 失敗: {current_status}, {error_code}", flush=True)
                 raise Exception(f'Bulk 失敗: {current_status} - {error_code}')
             time.sleep(5)
         
         # 發布
-        print(f"[TEST SYNC] 開始發布商品...")
+        print(f"[TEST SYNC] 開始發布商品...", flush=True)
         scrape_status['current_product'] = '發布...'
         scrape_status['phase'] = 'publishing'
         batch_publish_bape_products()
-        print(f"[TEST SYNC] 發布完成")
+        print(f"[TEST SYNC] 發布完成", flush=True)
         
         scrape_status['current_product'] = f"✅ 測試完成！上傳 {len(all_jsonl_entries)} 個商品"
         scrape_status['phase'] = 'completed'
+        print(f"[TEST SYNC] ✅ 測試完成！上傳 {len(all_jsonl_entries)} 個商品", flush=True)
         
         return {'success': True, 'total_products': len(all_jsonl_entries)}
         
     except Exception as e:
+        print(f"[TEST SYNC] ❌ 錯誤: {str(e)}", flush=True)
         scrape_status['errors'].append({'error': str(e)})
         scrape_status['current_product'] = f"❌ 錯誤: {str(e)}"
         scrape_status['phase'] = 'error'

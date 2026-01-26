@@ -560,8 +560,14 @@ def product_to_jsonl_entry(product, category_key, collection_id, existing_produc
     image_list = [img['src'] for img in images[:10]] if images else []
     first_image = image_list[0] if image_list else None
     
+    # 建立 image_id -> image_url 對應
+    image_id_to_url = {}
+    for img in images:
+        img_id = img.get('id')
+        if img_id:
+            image_id_to_url[img_id] = img.get('src', '')
+    
     files = [{"originalSource": img_url, "contentType": "IMAGE"} for img_url in image_list]
-    variant_file = {"originalSource": first_image, "contentType": "IMAGE"} if first_image else None
     
     variants = []
     for sv in source_variants:
@@ -598,8 +604,15 @@ def product_to_jsonl_entry(product, category_key, collection_id, existing_produc
         
         if option_values:
             variant["optionValues"] = option_values
-        if variant_file:
-            variant["file"] = variant_file
+        
+        # 找到這個 variant 對應的圖片
+        variant_image_id = sv.get('image_id') or sv.get('featured_image', {}).get('id')
+        if variant_image_id and variant_image_id in image_id_to_url:
+            variant_image_url = image_id_to_url[variant_image_id]
+            variant["file"] = {"originalSource": variant_image_url, "contentType": "IMAGE"}
+        elif first_image:
+            # 如果沒有對應圖片，用第一張
+            variant["file"] = {"originalSource": first_image, "contentType": "IMAGE"}
         
         variants.append(variant)
     
@@ -617,6 +630,9 @@ def product_to_jsonl_entry(product, category_key, collection_id, existing_produc
         "status": "ACTIVE",
         "handle": f"bape-{handle}",
         "tags": cat_info['tags'],
+        "productCategory": {
+            "productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/1"  # Apparel & Accessories
+        },
         "seo": {"title": seo_title, "description": seo_description},
         "metafields": [{"namespace": "custom", "key": "link", "value": source_url, "type": "url"}]
     }

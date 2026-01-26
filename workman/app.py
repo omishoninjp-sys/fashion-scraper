@@ -216,11 +216,13 @@ def get_all_publication_ids():
 
 
 def calculate_selling_price(cost, weight):
-    """計算售價"""
-    shipping_cost = 800 + (weight * 400)
+    """計算售價
+    公式：(成本 + 重量 * 1250) / 0.7
+    """
+    shipping_cost = weight * 1250
     base_price = cost + shipping_cost
-    selling_price = base_price * 1.15
-    return round(selling_price / 10) * 10
+    selling_price = base_price / 0.7
+    return int(selling_price)  # 無條件捨去到整數
 
 
 def contains_japanese(text):

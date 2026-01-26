@@ -831,14 +831,35 @@ def batch_publish_bape_products():
     publication_inputs = [{"publicationId": pub['id']} for pub in publications]
     results = {'total': len(products), 'success': 0, 'failed': 0, 'errors': []}
     
-    mutation = """mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) { publishablePublish(id: $id, input: $input) { userErrors { field message } } }"""
+    # 發布 mutation
+    pub_mutation = """mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) { publishablePublish(id: $id, input: $input) { userErrors { field message } } }"""
+    
+    # 設定 Category mutation
+    category_mutation = """mutation productUpdate($input: ProductInput!) {
+        productUpdate(input: $input) {
+            product { id }
+            userErrors { field message }
+        }
+    }"""
     
     for product in products:
-        result = graphql_request(mutation, {"id": product['id'], "input": publication_inputs})
+        # 發布到銷售渠道
+        result = graphql_request(pub_mutation, {"id": product['id'], "input": publication_inputs})
         if result.get('data', {}).get('publishablePublish', {}).get('userErrors', []):
             results['failed'] += 1
         else:
             results['success'] += 1
+        
+        # 設定 Category 為 Apparel & Accessories
+        cat_result = graphql_request(category_mutation, {
+            "input": {
+                "id": product['id'],
+                "productCategory": {
+                    "productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/1"
+                }
+            }
+        })
+        
         time.sleep(0.1)
     
     return results
@@ -1895,7 +1916,7 @@ def api_check_taxonomy():
 
 @app.route('/api/force_publish')
 def api_force_publish():
-    """強制發布所有 BAPE 商品到所有渠道"""
+    """強制發布所有 BAPE 商品到所有渠道，並設定 Category"""
     try:
         # 取得所有 publications
         publications = get_all_publications()
@@ -1915,13 +1936,14 @@ def api_force_publish():
         
         # 發布每個商品
         success_count = 0
+        category_count = 0
         errors = []
         
         for product in products:
             product_id = product['id']
-            print(f"[PUBLISH] 發布: {product['title'][:30]}...", flush=True)
+            print(f"[PUBLISH] 處理: {product['title'][:30]}...", flush=True)
             
-            # 先設為 ACTIVE
+            # 設為 ACTIVE 並設定 Category
             update_mutation = """mutation productUpdate($input: ProductInput!) {
                 productUpdate(input: $input) {
                     product { id status }
@@ -1930,13 +1952,20 @@ def api_force_publish():
             }"""
             
             update_result = graphql_request(update_mutation, {
-                "input": {"id": product_id, "status": "ACTIVE"}
+                "input": {
+                    "id": product_id,
+                    "status": "ACTIVE",
+                    "productCategory": {
+                        "productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/1"
+                    }
+                }
             })
             
             update_errors = update_result.get('data', {}).get('productUpdate', {}).get('userErrors', [])
             if update_errors:
                 errors.append(f"{product['title']}: {update_errors}")
-                continue
+            else:
+                category_count += 1
             
             # 發布到所有渠道
             pub_mutation = """mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
@@ -1962,6 +1991,7 @@ def api_force_publish():
             'success': True,
             'total': len(products),
             'published': success_count,
+            'category_set': category_count,
             'errors': errors
         })
         

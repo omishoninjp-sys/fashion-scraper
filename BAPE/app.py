@@ -1734,6 +1734,183 @@ def api_count():
     return jsonify({'count': result.get('data', {}).get('productsCount', {}).get('count', 0)})
 
 
+@app.route('/api/check_taxonomy')
+def api_check_taxonomy():
+    """查詢 Shopify 商品分類 ID"""
+    try:
+        # 查詢 Apparel & Accessories
+        query = """query {
+            taxonomy {
+                categories(first: 20, query: "Apparel") {
+                    edges {
+                        node {
+                            id
+                            name
+                            fullName
+                        }
+                    }
+                }
+            }
+        }"""
+        
+        result = graphql_request(query)
+        return jsonify(result)
+        
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
+
+
+@app.route('/api/force_publish')
+def api_force_publish():
+    """強制發布所有 BAPE 商品到所有渠道"""
+    try:
+        # 取得所有 publications
+        publications = get_all_publications()
+        if not publications:
+            return jsonify({'error': '無法取得 Publications'})
+        
+        print(f"[PUBLISH] 找到 {len(publications)} 個 Publications:", flush=True)
+        for pub in publications:
+            print(f"  - {pub['name']} ({pub['id']})", flush=True)
+        
+        # 取得所有 BAPE 商品
+        products = fetch_bape_product_ids()
+        print(f"[PUBLISH] 找到 {len(products)} 個 BAPE 商品", flush=True)
+        
+        if not products:
+            return jsonify({'error': '沒有找到 BAPE 商品'})
+        
+        # 發布每個商品
+        success_count = 0
+        errors = []
+        
+        for product in products:
+            product_id = product['id']
+            print(f"[PUBLISH] 發布: {product['title'][:30]}...", flush=True)
+            
+            # 先設為 ACTIVE
+            update_mutation = """mutation productUpdate($input: ProductInput!) {
+                productUpdate(input: $input) {
+                    product { id status }
+                    userErrors { field message }
+                }
+            }"""
+            
+            update_result = graphql_request(update_mutation, {
+                "input": {"id": product_id, "status": "ACTIVE"}
+            })
+            
+            update_errors = update_result.get('data', {}).get('productUpdate', {}).get('userErrors', [])
+            if update_errors:
+                errors.append(f"{product['title']}: {update_errors}")
+                continue
+            
+            # 發布到所有渠道
+            pub_mutation = """mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+                publishablePublish(id: $id, input: $input) {
+                    userErrors { field message }
+                }
+            }"""
+            
+            pub_result = graphql_request(pub_mutation, {
+                "id": product_id,
+                "input": [{"publicationId": pub['id']} for pub in publications]
+            })
+            
+            pub_errors = pub_result.get('data', {}).get('publishablePublish', {}).get('userErrors', [])
+            if pub_errors:
+                errors.append(f"{product['title']}: {pub_errors}")
+            else:
+                success_count += 1
+            
+            time.sleep(0.2)
+        
+        return jsonify({
+            'success': True,
+            'total': len(products),
+            'published': success_count,
+            'errors': errors
+        })
+        
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
+
+
+@app.route('/api/check_products')
+def api_check_products():
+    """檢查 Shopify 上的 BAPE 商品狀態"""
+    try:
+        # 查詢 BAPE 商品
+        query = """query {
+            products(first: 50, query: "vendor:BAPE") {
+                edges {
+                    node {
+                        id
+                        title
+                        handle
+                        status
+                        publishedAt
+                        totalInventory
+                        collections(first: 5) {
+                            edges {
+                                node {
+                                    title
+                                }
+                            }
+                        }
+                        resourcePublicationsV2(first: 5) {
+                            edges {
+                                node {
+                                    publication {
+                                        name
+                                    }
+                                    isPublished
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"""
+        
+        result = graphql_request(query)
+        products = result.get('data', {}).get('products', {}).get('edges', [])
+        
+        product_list = []
+        for edge in products:
+            node = edge['node']
+            collections = [c['node']['title'] for c in node.get('collections', {}).get('edges', [])]
+            publications = []
+            for pub in node.get('resourcePublicationsV2', {}).get('edges', []):
+                pub_node = pub['node']
+                publications.append({
+                    'name': pub_node.get('publication', {}).get('name', ''),
+                    'isPublished': pub_node.get('isPublished', False)
+                })
+            
+            product_list.append({
+                'id': node['id'],
+                'title': node['title'][:50],
+                'handle': node['handle'],
+                'status': node['status'],
+                'publishedAt': node['publishedAt'],
+                'totalInventory': node['totalInventory'],
+                'collections': collections,
+                'publications': publications
+            })
+        
+        return jsonify({
+            'total': len(product_list),
+            'products': product_list
+        })
+        
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
+
+
 @app.route('/api/test_bape')
 def api_test_bape():
     """測試連線到 jp.bape.com 並顯示分類統計"""

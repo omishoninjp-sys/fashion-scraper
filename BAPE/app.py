@@ -408,7 +408,8 @@ def fetch_size_table(handle):
 
 # ========== JSONL 生成 ==========
 
-def product_to_jsonl_entry(product, category_key, collection_id):
+def product_to_jsonl_entry(product, category_key, collection_id, existing_product_id=None):
+    """將商品資料轉換為 JSONL 格式，支援更新現有商品"""
     cat_info = CATEGORIES[category_key]
     
     title = product.get('title', '')
@@ -499,6 +500,10 @@ def product_to_jsonl_entry(product, category_key, collection_id):
         "metafields": [{"namespace": "custom", "key": "link", "value": source_url, "type": "url"}]
     }
     
+    # 如果商品已存在，加入 id 來更新
+    if existing_product_id:
+        product_input["id"] = existing_product_id
+    
     if collection_id:
         product_input["collections"] = [collection_id]
     if product_options:
@@ -572,6 +577,23 @@ def get_all_publications():
     query = """{ publications(first: 20) { edges { node { id name } } } }"""
     result = graphql_request(query)
     return [{'id': edge['node']['id'], 'name': edge['node']['name']} for edge in result.get('data', {}).get('publications', {}).get('edges', [])]
+
+
+def get_product_id_by_handle(handle):
+    """根據 handle 查詢商品 ID"""
+    query = """
+    query getProductByHandle($handle: String!) {
+      productByHandle(handle: $handle) {
+        id
+        title
+      }
+    }
+    """
+    result = graphql_request(query, {"handle": handle})
+    product = result.get('data', {}).get('productByHandle')
+    if product:
+        return product['id']
+    return None
 
 
 def fetch_bape_product_ids():
@@ -675,8 +697,16 @@ def run_test_single(category='mens'):
         
         print(f"[TEST] 測試商品: {test_product.get('title', '')[:50]}")
         
+        # 檢查商品是否已存在
+        my_handle = f"bape-{test_product.get('handle', '')}"
+        existing_id = get_product_id_by_handle(my_handle)
+        if existing_id:
+            print(f"[TEST] 商品已存在，將進行更新: {existing_id}")
+        else:
+            print(f"[TEST] 商品不存在，將建立新商品")
+        
         scrape_status['current_product'] = f"翻譯: {test_product['title'][:30]}..."
-        entry = product_to_jsonl_entry(test_product, category, collection_id)
+        entry = product_to_jsonl_entry(test_product, category, collection_id, existing_id)
         
         if not entry:
             scrape_status['errors'].append({'error': '商品轉換失敗（可能沒有有效的 variant）'})
@@ -749,6 +779,12 @@ def run_scrape(category):
             scrape_status['errors'].append({'error': f'未知分類: {category}'})
             return
         
+        # 先取得所有現有商品的 handle -> id 映射
+        scrape_status['current_product'] = '取得現有商品...'
+        existing_products = fetch_bape_product_ids()
+        existing_handles = {p['handle']: p['id'] for p in existing_products}
+        print(f"[SCRAPE] 現有 {len(existing_handles)} 個 BAPE 商品")
+        
         all_jsonl_entries = []
         
         for cat_key in categories_to_scrape:
@@ -768,7 +804,10 @@ def run_scrape(category):
                 scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {product.get('title', '')[:30]}"
                 
                 try:
-                    entry = product_to_jsonl_entry(product, cat_key, collection_id)
+                    my_handle = f"bape-{product.get('handle', '')}"
+                    existing_id = existing_handles.get(my_handle)
+                    
+                    entry = product_to_jsonl_entry(product, cat_key, collection_id, existing_id)
                     if entry:
                         all_jsonl_entries.append(entry)
                         scrape_status['products'].append({'title': entry['productSet']['title'], 'handle': entry['productSet']['handle'], 'variants': len(entry['productSet'].get('variants', []))})
@@ -827,9 +866,10 @@ def run_full_sync(category='all'):
     scrape_status = {"running": True, "phase": "cron_sync", "progress": 0, "total": 0, "current_product": "開始...", "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "set_to_draft": 0}
     
     try:
-        # 取得 Shopify 現有商品
+        # 取得 Shopify 現有商品（包含 id）
+        scrape_status['current_product'] = '取得 Shopify 現有商品...'
         existing_products = fetch_bape_product_ids()
-        existing_handles = {p['handle']: p for p in existing_products}
+        existing_handles = {p['handle']: p for p in existing_products}  # handle -> {id, title, status}
         print(f"[CRON] Shopify 現有 {len(existing_handles)} 個商品")
         
         # 爬取官網
@@ -861,8 +901,12 @@ def run_full_sync(category='all'):
                 my_handle = f"bape-{handle}"
                 scraped_handles.add(my_handle)
                 
+                # 查找現有商品的 ID
+                existing_info = existing_handles.get(my_handle)
+                existing_id = existing_info['id'] if existing_info else None
+                
                 try:
-                    entry = product_to_jsonl_entry(product, cat_key, collection_id)
+                    entry = product_to_jsonl_entry(product, cat_key, collection_id, existing_id)
                     if entry:
                         all_jsonl_entries.append(entry)
                         scrape_status['products'].append({'title': entry['productSet']['title'], 'handle': entry['productSet']['handle'], 'variants': len(entry['productSet'].get('variants', []))})

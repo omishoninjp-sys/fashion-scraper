@@ -336,66 +336,133 @@ def clean_description(description):
 
 # ========== 爬取函數 ==========
 
-def fetch_category_products_html(category_key, page=1):
-    """從 BAPE 網站 HTML 頁面取得商品列表"""
-    cat_info = CATEGORIES[category_key]
+def fetch_products_json(page=1):
+    """從 BAPE 網站取得所有商品（JSON API）"""
+    url = f"{SOURCE_URL}/collections/all/products.json?page={page}&limit=50"
     
-    # 使用 HTML 頁面（支援 filter）
-    if page == 1:
-        url = f"{SOURCE_URL}{cat_info['base_url']}?{cat_info['filter']}"
-    else:
-        url = f"{SOURCE_URL}{cat_info['base_url']}?{cat_info['filter']}&page={page}"
-    
-    print(f"[爬取] {cat_info['name']} 第 {page} 頁: {url}")
+    print(f"[爬取] 第 {page} 頁: {url}")
     
     try:
         response = requests.get(url, headers=HEADERS, timeout=30)
         print(f"[爬取] HTTP 狀態: {response.status_code}")
         
         if response.status_code != 200:
-            print(f"[錯誤] HTTP {response.status_code}")
+            return []
+        
+        data = response.json()
+        products = data.get('products', [])
+        print(f"[爬取] 第 {page} 頁取得 {len(products)} 個商品")
+        return products
+        
+    except Exception as e:
+        print(f"[錯誤] {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def get_product_category(product):
+    """根據商品資訊判斷分類"""
+    tags = product.get('tags', [])
+    title = product.get('title', '').upper()
+    
+    # 優先檢查 tags
+    tags_str = ','.join(tags).lower() if isinstance(tags, list) else str(tags).lower()
+    
+    # 童裝判斷（優先，因為童裝商品名稱可能不含 KIDS）
+    if 'キッズ' in tags_str or 'kids' in tags_str or 'KIDS' in title or 'キッズ' in title:
+        return 'kids'
+    
+    # 女裝判斷
+    if 'レディース' in tags_str or 'ladies' in tags_str or 'women' in tags_str or 'LADIES' in title or 'レディース' in title:
+        return 'womens'
+    
+    # 男裝判斷（預設）
+    if 'メンズ' in tags_str or 'mens' in tags_str or 'men' in tags_str or 'メンズ' in title:
+        return 'mens'
+    
+    # 無法判斷時預設為男裝
+    return 'mens'
+
+
+def fetch_all_products_by_category():
+    """取得所有商品並按分類整理"""
+    all_products = {'mens': [], 'womens': [], 'kids': []}
+    page = 1
+    seen_handles = set()
+    
+    while True:
+        products = fetch_products_json(page)
+        
+        if not products:
+            break
+        
+        new_count = 0
+        for p in products:
+            handle = p.get('handle', '')
+            if handle in seen_handles:
+                continue
+            seen_handles.add(handle)
+            
+            # 檢查庫存
+            has_stock = any(v.get('available', False) for v in p.get('variants', []))
+            if not has_stock:
+                continue
+            
+            # 判斷分類
+            category = get_product_category(p)
+            all_products[category].append(p)
+            new_count += 1
+        
+        print(f"[爬取] 第 {page} 頁新增 {new_count} 個有庫存商品")
+        
+        if len(products) < 50:
+            break
+        
+        page += 1
+        time.sleep(0.5)
+    
+    print(f"[爬取] 分類結果: 男裝 {len(all_products['mens'])}, 女裝 {len(all_products['womens'])}, 童裝 {len(all_products['kids'])}")
+    return all_products
+
+
+def fetch_category_products_html(category_key, page=1):
+    """從 BAPE 網站 HTML 頁面取得商品列表（備用方法）"""
+    cat_info = CATEGORIES[category_key]
+    
+    if page == 1:
+        url = f"{SOURCE_URL}{cat_info['base_url']}?{cat_info['filter']}"
+    else:
+        url = f"{SOURCE_URL}{cat_info['base_url']}?{cat_info['filter']}&page={page}"
+    
+    print(f"[爬取 HTML] {cat_info['name']} 第 {page} 頁: {url}")
+    
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=30)
+        print(f"[爬取 HTML] HTTP 狀態: {response.status_code}")
+        
+        if response.status_code != 200:
             return [], False
         
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 除錯：顯示頁面標題
-        title_tag = soup.find('title')
-        print(f"[爬取] 頁面標題: {title_tag.get_text()[:50] if title_tag else 'N/A'}")
-        
-        # 找商品連結
         product_handles = []
-        
-        # 找所有包含 /products/ 的連結
         all_links = soup.find_all('a', href=True)
-        print(f"[爬取] 找到 {len(all_links)} 個連結")
         
         for link in all_links:
             href = link.get('href', '')
             if '/products/' in href:
-                # 提取 handle
                 match = re.search(r'/products/([^/?#]+)', href)
                 if match:
                     handle = match.group(1)
                     if handle not in product_handles and handle != 'products':
                         product_handles.append(handle)
         
-        print(f"[爬取] 第 {page} 頁找到 {len(product_handles)} 個商品")
+        print(f"[爬取 HTML] 找到 {len(product_handles)} 個商品")
         
-        # 除錯：顯示前 5 個 handle
-        if product_handles:
-            print(f"[爬取] 前 5 個: {product_handles[:5]}")
-        else:
-            # 如果沒找到，顯示一些連結樣本
-            sample_links = [a.get('href', '') for a in all_links[:20]]
-            print(f"[爬取] 連結樣本: {sample_links}")
-        
-        # 檢查是否有下一頁
         has_next_page = False
-        
-        # 檢查 pagination
         for link in all_links:
-            href = link.get('href', '')
-            if f'page={page + 1}' in href:
+            if f'page={page + 1}' in link.get('href', ''):
                 has_next_page = True
                 break
         
@@ -403,8 +470,6 @@ def fetch_category_products_html(category_key, page=1):
         
     except Exception as e:
         print(f"[錯誤] {e}")
-        import traceback
-        traceback.print_exc()
         return [], False
 
 
@@ -423,62 +488,12 @@ def fetch_product_json(handle):
     return None
 
 
-def fetch_category_products_json(category_key, page=1):
-    """從 BAPE 網站取得特定分類的商品（使用 JSON API，僅用於測試）"""
-    cat_info = CATEGORIES[category_key]
-    url = f"{SOURCE_URL}{cat_info['base_url']}/products.json?{cat_info['filter']}&page={page}&limit=50"
-    
-    print(f"[爬取] {cat_info['name']} 第 {page} 頁")
-    
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        if response.status_code != 200:
-            return []
-        return response.json().get('products', [])
-    except Exception as e:
-        print(f"[錯誤] {e}")
-        return []
-
-
 def fetch_all_category_products(category_key):
-    """取得分類內所有商品（使用 HTML 頁面爬取）"""
-    all_products = []
-    page = 1
-    seen_handles = set()
-    
-    while True:
-        handles, has_next = fetch_category_products_html(category_key, page)
-        
-        if not handles:
-            break
-        
-        new_handles = [h for h in handles if h not in seen_handles]
-        if not new_handles:
-            break
-        
-        for handle in new_handles:
-            seen_handles.add(handle)
-            
-            # 取得商品 JSON
-            product = fetch_product_json(handle)
-            if not product:
-                continue
-            
-            # 檢查是否有庫存
-            has_stock = any(v.get('available', False) for v in product.get('variants', []))
-            if has_stock:
-                all_products.append(product)
-            
-            time.sleep(0.3)
-        
-        if not has_next:
-            break
-        
-        page += 1
-        time.sleep(0.5)
-    
-    print(f"[爬取] {CATEGORIES[category_key]['name']} 共 {len(all_products)} 個有庫存商品")
-    return all_products
+    """取得分類內所有商品（使用 JSON API + 程式過濾）"""
+    all_by_category = fetch_all_products_by_category()
+    products = all_by_category.get(category_key, [])
+    print(f"[爬取] {CATEGORIES[category_key]['name']} 共 {len(products)} 個有庫存商品")
+    return products
 
 
 def fetch_size_table(handle):
@@ -830,30 +845,24 @@ def run_test_single(category='mens'):
         
         scrape_status['current_product'] = f"爬取商品..."
         
-        # 使用 HTML 爬取取得該分類的商品
-        handles, _ = fetch_category_products_html(category, 1)
-        print(f"[TEST] 取得 {len(handles)} 個商品 handle")
+        # 取得所有商品並分類
+        all_by_category = fetch_all_products_by_category()
+        products = all_by_category.get(category, [])
         
-        if not handles:
-            scrape_status['errors'].append({'error': '無法取得商品，請檢查網路連線或分類設定'})
-            scrape_status['current_product'] = '❌ 無法取得商品'
+        print(f"[TEST] {category} 有 {len(products)} 個商品")
+        
+        if not products:
+            scrape_status['errors'].append({'error': f'沒有找到 {cat_info["name"]} 的商品'})
+            scrape_status['current_product'] = f'❌ 沒有找到 {cat_info["name"]} 的商品'
             return
         
-        # 取得第一個有庫存且價格符合的商品
+        # 取第一個符合條件的商品
         test_product = None
-        for handle in handles[:10]:  # 最多嘗試 10 個
-            product = fetch_product_json(handle)
-            if not product:
-                continue
-            
-            has_stock = any(v.get('available', False) for v in product.get('variants', []))
-            min_price = min((float(v.get('price', 0)) for v in product.get('variants', [])), default=0)
-            
-            if has_stock and min_price >= MIN_PRICE:
-                test_product = product
+        for p in products:
+            min_price = min((float(v.get('price', 0)) for v in p.get('variants', [])), default=0)
+            if min_price >= MIN_PRICE:
+                test_product = p
                 break
-            
-            time.sleep(0.3)
         
         if not test_product:
             scrape_status['errors'].append({'error': f'沒有符合條件的商品（價格 >= {MIN_PRICE}）'})
@@ -1038,55 +1047,39 @@ def run_test_sync(category='all', limit=10):
         existing_handles = {p['handle']: p for p in existing_products}
         print(f"[TEST SYNC] 現有 {len(existing_handles)} 個商品")
         
+        # 取得所有商品並分類
+        scrape_status['current_product'] = '爬取商品...'
+        all_by_category = fetch_all_products_by_category()
+        
         categories_to_scrape = ['mens', 'womens', 'kids'] if category == 'all' else [category] if category in CATEGORIES else []
         if not categories_to_scrape:
             raise Exception(f'未知分類: {category}')
-        
-        print(f"[TEST SYNC] 要爬取的分類: {categories_to_scrape}")
         
         all_jsonl_entries = []
         
         for cat_key in categories_to_scrape:
             cat_info = CATEGORIES[cat_key]
-            scrape_status['current_product'] = f"爬取 {cat_info['collection']} (限 {limit} 個)..."
-            print(f"[TEST SYNC] 開始爬取 {cat_info['collection']}...")
+            scrape_status['current_product'] = f"處理 {cat_info['collection']} (限 {limit} 個)..."
             
             collection_id = get_or_create_collection(cat_info['collection'])
             if not collection_id:
-                print(f"[TEST SYNC] 無法取得 Collection: {cat_info['collection']}")
                 scrape_status['errors'].append({'error': f"無法取得 Collection: {cat_info['collection']}"})
                 continue
             
-            print(f"[TEST SYNC] Collection ID: {collection_id}")
+            # 取得該分類的商品，限制數量
+            products = all_by_category.get(cat_key, [])[:limit]
+            print(f"[TEST SYNC] {cat_info['collection']} 取 {len(products)} 個商品")
             
-            # 只取第一頁的 handle，限制數量
-            handles, _ = fetch_category_products_html(cat_key, 1)
-            print(f"[TEST SYNC] 取得 {len(handles)} 個 handle")
-            
-            if not handles:
-                print(f"[TEST SYNC] {cat_info['collection']} 沒有找到商品")
+            if not products:
                 scrape_status['errors'].append({'error': f"{cat_info['collection']} 沒有找到商品"})
                 continue
             
-            handles = handles[:limit]  # 限制數量
-            print(f"[TEST SYNC] 限制後: {len(handles)} 個")
+            scrape_status['total'] += len(products)
             
-            scrape_status['total'] += len(handles)
-            
-            for handle in handles:
+            for product in products:
                 scrape_status['progress'] += 1
-                scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {handle[:30]}"
-                
-                print(f"[TEST SYNC] 取得商品 JSON: {handle}")
-                product = fetch_product_json(handle)
-                if not product:
-                    print(f"[TEST SYNC] 無法取得商品: {handle}")
-                    continue
-                
-                has_stock = any(v.get('available', False) for v in product.get('variants', []))
-                if not has_stock:
-                    print(f"[TEST SYNC] 無庫存: {handle}")
-                    continue
+                handle = product.get('handle', '')
+                scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {product.get('title', '')[:30]}"
                 
                 my_handle = f"bape-{handle}"
                 existing_info = existing_handles.get(my_handle)
@@ -1106,7 +1099,7 @@ def run_test_sync(category='all', limit=10):
                     print(f"[TEST SYNC] 轉換失敗: {e}")
                     scrape_status['errors'].append({'error': str(e)})
                 
-                time.sleep(0.5)
+                time.sleep(0.3)
         
         print(f"[TEST SYNC] 總共 {len(all_jsonl_entries)} 個商品")
         
@@ -1119,7 +1112,6 @@ def run_test_sync(category='all', limit=10):
             for entry in all_jsonl_entries:
                 f.write(json.dumps(entry, ensure_ascii=False) + '\n')
         scrape_status['jsonl_file'] = jsonl_path
-        print(f"[TEST SYNC] JSONL: {jsonl_path}")
         
         # 批量上傳
         print(f"[TEST SYNC] 批量上傳 {len(all_jsonl_entries)} 個商品...")
@@ -1183,10 +1175,13 @@ def run_full_sync(category='all'):
         # 取得 Shopify 現有商品（包含 id）
         scrape_status['current_product'] = '取得 Shopify 現有商品...'
         existing_products = fetch_bape_product_ids()
-        existing_handles = {p['handle']: p for p in existing_products}  # handle -> {id, title, status}
+        existing_handles = {p['handle']: p for p in existing_products}
         print(f"[CRON] Shopify 現有 {len(existing_handles)} 個商品")
         
-        # 爬取官網
+        # 取得所有商品並分類
+        scrape_status['current_product'] = '爬取商品...'
+        all_by_category = fetch_all_products_by_category()
+        
         categories_to_scrape = ['mens', 'womens', 'kids'] if category == 'all' else [category] if category in CATEGORIES else []
         if not categories_to_scrape:
             raise Exception(f'未知分類: {category}')
@@ -1196,26 +1191,25 @@ def run_full_sync(category='all'):
         
         for cat_key in categories_to_scrape:
             cat_info = CATEGORIES[cat_key]
-            scrape_status['current_product'] = f"爬取 {cat_info['collection']}..."
+            scrape_status['current_product'] = f"處理 {cat_info['collection']}..."
             
             collection_id = get_or_create_collection(cat_info['collection'])
             if not collection_id:
                 continue
             
-            products = fetch_all_category_products(cat_key)
-            print(f"[CRON] {cat_info['collection']} 找到 {len(products)} 個商品")
+            products = all_by_category.get(cat_key, [])
+            print(f"[CRON] {cat_info['collection']} 共 {len(products)} 個商品")
             
             scrape_status['total'] += len(products)
             
             for product in products:
                 scrape_status['progress'] += 1
+                handle = product.get('handle', '')
                 scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {product.get('title', '')[:30]}"
                 
-                handle = product.get('handle', '')
                 my_handle = f"bape-{handle}"
                 scraped_handles.add(my_handle)
                 
-                # 查找現有商品的 ID
                 existing_info = existing_handles.get(my_handle)
                 existing_id = existing_info['id'] if existing_info else None
                 
@@ -1223,11 +1217,15 @@ def run_full_sync(category='all'):
                     entry = product_to_jsonl_entry(product, cat_key, collection_id, existing_id)
                     if entry:
                         all_jsonl_entries.append(entry)
-                        scrape_status['products'].append({'title': entry['productSet']['title'], 'handle': entry['productSet']['handle'], 'variants': len(entry['productSet'].get('variants', []))})
+                        scrape_status['products'].append({
+                            'title': entry['productSet']['title'],
+                            'handle': entry['productSet']['handle'],
+                            'variants': len(entry['productSet'].get('variants', []))
+                        })
                 except Exception as e:
                     scrape_status['errors'].append({'error': str(e)})
                 
-                time.sleep(0.5)
+                time.sleep(0.3)
         
         if not all_jsonl_entries:
             raise Exception('沒有爬取到商品')
@@ -1659,43 +1657,130 @@ def api_count():
 
 @app.route('/api/test_bape')
 def api_test_bape():
-    """測試連線到 jp.bape.com（使用 HTML 爬取）"""
+    """測試連線到 jp.bape.com 並顯示分類統計"""
     results = {}
     
-    for cat_key, cat_info in CATEGORIES.items():
-        try:
-            # 測試 HTML 頁面
-            if cat_info['filter']:
-                url = f"{SOURCE_URL}{cat_info['base_url']}?{cat_info['filter']}"
-            else:
-                url = f"{SOURCE_URL}{cat_info['base_url']}"
+    try:
+        # 先測試基本連線
+        url = f"{SOURCE_URL}/collections/all/products.json?page=1&limit=10"
+        print(f"[TEST BAPE] 測試連線: {url}")
+        
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        
+        results['connection'] = {
+            'url': url,
+            'status': response.status_code,
+            'ok': response.status_code == 200
+        }
+        
+        if response.status_code == 200:
+            # 取得所有商品並分類
+            all_by_category = fetch_all_products_by_category()
             
-            response = requests.get(url, headers=HEADERS, timeout=15)
-            
-            results[cat_key] = {
-                'name': cat_info['name'],
-                'status': response.status_code,
-                'ok': response.status_code == 200
+            results['categories'] = {
+                'mens': {
+                    'name': 'メンズ（男裝）',
+                    'count': len(all_by_category.get('mens', []))
+                },
+                'womens': {
+                    'name': 'レディース（女裝）',
+                    'count': len(all_by_category.get('womens', []))
+                },
+                'kids': {
+                    'name': 'キッズ（童裝）',
+                    'count': len(all_by_category.get('kids', []))
+                }
             }
             
-            if response.status_code == 200:
-                # 計算找到的商品數
-                soup = BeautifulSoup(response.text, 'html.parser')
-                product_links = set()
-                for link in soup.find_all('a', href=True):
-                    href = link.get('href', '')
-                    if '/products/' in href:
-                        match = re.search(r'/products/([^/?]+)', href)
-                        if match:
-                            product_links.add(match.group(1))
-                
-                results[cat_key]['products_found'] = len(product_links)
-                if product_links:
-                    results[cat_key]['first_product'] = list(product_links)[0]
-        except Exception as e:
-            results[cat_key] = {'error': str(e), 'ok': False}
+            total = sum(len(v) for v in all_by_category.values())
+            results['total_products'] = total
+            
+            # 顯示每個分類的前 3 個商品
+            for cat_key in ['mens', 'womens', 'kids']:
+                products = all_by_category.get(cat_key, [])[:3]
+                results['categories'][cat_key]['samples'] = [
+                    {'title': p.get('title', '')[:50], 'handle': p.get('handle', '')}
+                    for p in products
+                ]
+        
+    except requests.exceptions.Timeout:
+        results['error'] = '連線超時'
+    except requests.exceptions.ConnectionError as e:
+        results['error'] = f'連線失敗: {str(e)[:100]}'
+    except Exception as e:
+        results['error'] = str(e)
+        import traceback
+        results['traceback'] = traceback.format_exc()
     
     return jsonify(results)
+
+
+@app.route('/api/test_html')
+def api_test_html():
+    """直接測試 HTML 爬取"""
+    category = request.args.get('category', 'mens')
+    
+    if category not in CATEGORIES:
+        return jsonify({'error': f'無效分類: {category}'})
+    
+    cat_info = CATEGORIES[category]
+    url = f"{SOURCE_URL}{cat_info['base_url']}?{cat_info['filter']}"
+    
+    result = {
+        'category': category,
+        'url': url
+    }
+    
+    try:
+        print(f"[TEST HTML] 請求: {url}")
+        response = requests.get(url, headers=HEADERS, timeout=30)
+        
+        result['status'] = response.status_code
+        result['content_length'] = len(response.text)
+        result['headers'] = dict(response.headers)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 頁面標題
+            title = soup.find('title')
+            result['page_title'] = title.get_text()[:100] if title else None
+            
+            # 所有連結
+            all_links = soup.find_all('a', href=True)
+            result['total_links'] = len(all_links)
+            
+            # 商品連結
+            product_handles = []
+            for link in all_links:
+                href = link.get('href', '')
+                if '/products/' in href:
+                    match = re.search(r'/products/([^/?#]+)', href)
+                    if match and match.group(1) != 'products':
+                        if match.group(1) not in product_handles:
+                            product_handles.append(match.group(1))
+            
+            result['products_found'] = len(product_handles)
+            result['product_handles'] = product_handles[:20]
+            
+            # 連結樣本
+            result['sample_links'] = [a.get('href', '')[:80] for a in all_links[:30]]
+            
+            # HTML 片段（前 2000 字元）
+            result['html_preview'] = response.text[:2000]
+        else:
+            result['response_text'] = response.text[:1000]
+            
+    except requests.exceptions.Timeout:
+        result['error'] = '連線超時 (30秒)'
+    except requests.exceptions.ConnectionError as e:
+        result['error'] = f'連線失敗: {str(e)}'
+    except Exception as e:
+        result['error'] = str(e)
+        import traceback
+        result['traceback'] = traceback.format_exc()
+    
+    return jsonify(result)
 
 
 if __name__ == '__main__':

@@ -1036,6 +1036,7 @@ def run_scrape():
                 translated_title = result.get('translated', {}).get('title', title)
                 variants_count = result.get('variants_count', 0)
                 print(f"[成功] {translated_title} ({variants_count} variants)")
+                existing_handles.add(my_handle)  # 防止同一批次重複上架
                 scrape_status['uploaded'] += 1
                 scrape_status['products'].append({
                     'handle': handle,

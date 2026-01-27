@@ -92,7 +92,7 @@ def load_shopify_token():
 
 def graphql_request(query, variables=None):
     load_shopify_token()
-    url = f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-01/graphql.json"
+    url = f"https://{SHOPIFY_SHOP}.myshopify.com/admin/api/2024-10/graphql.json"
     headers = {
         'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
         'Content-Type': 'application/json',
@@ -1899,62 +1899,75 @@ def api_test_category():
         product = products[0]
         product_id = product['id']
         
-        # 嘗試不同的 taxonomy node ID
-        # Apparel & Accessories 的標準 ID
-        test_ids = [
-            "gid://shopify/ProductTaxonomyNode/1",
-            "gid://shopify/ProductTaxonomyNode/166",  # Apparel & Accessories
-            "gid://shopify/ProductTaxonomyNode/212",  # Clothing
-        ]
-        
         results = []
         
-        for node_id in test_ids:
-            mutation = """mutation productUpdate($input: ProductInput!) {
-                productUpdate(input: $input) {
-                    product {
-                        id
-                        title
-                        productCategory {
-                            productTaxonomyNode {
-                                id
-                                name
-                                fullName
-                            }
+        # 方法 1: 使用 productUpdate
+        mutation1 = """mutation productUpdate($input: ProductInput!) {
+            productUpdate(input: $input) {
+                product {
+                    id
+                    productCategory {
+                        productTaxonomyNode {
+                            id
+                            name
+                            fullName
                         }
                     }
-                    userErrors {
-                        field
-                        message
+                }
+                userErrors { field message }
+            }
+        }"""
+        
+        result1 = graphql_request(mutation1, {
+            "input": {
+                "id": product_id,
+                "productCategory": {
+                    "productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/166"
+                }
+            }
+        })
+        results.append({'method': 'productUpdate', 'result': result1})
+        
+        # 方法 2: 使用 productSet 更新現有商品
+        mutation2 = """mutation productSet($input: ProductSetInput!) {
+            productSet(input: $input) {
+                product {
+                    id
+                    productCategory {
+                        productTaxonomyNode {
+                            id
+                            name
+                            fullName
+                        }
                     }
                 }
-            }"""
-            
-            result = graphql_request(mutation, {
-                "input": {
-                    "id": product_id,
-                    "productCategory": {
-                        "productTaxonomyNodeId": node_id
-                    }
+                userErrors { field message code }
+            }
+        }"""
+        
+        result2 = graphql_request(mutation2, {
+            "input": {
+                "id": product_id,
+                "productCategory": {
+                    "productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/166"
                 }
-            })
-            
-            results.append({
-                'tried_id': node_id,
-                'result': result
-            })
-            
-            # 如果成功了，停止
-            user_errors = result.get('data', {}).get('productUpdate', {}).get('userErrors', [])
-            if not user_errors:
-                product_cat = result.get('data', {}).get('productUpdate', {}).get('product', {}).get('productCategory')
-                if product_cat:
-                    results.append({'success': True, 'working_id': node_id, 'category': product_cat})
-                    break
+            }
+        })
+        results.append({'method': 'productSet with id', 'result': result2})
+        
+        # 方法 3: 查詢 API 版本支援
+        version_query = """query {
+            shop {
+                name
+            }
+        }"""
+        version_result = graphql_request(version_query)
+        results.append({'method': 'API check', 'result': version_result})
         
         return jsonify({
             'product_id': product_id,
             'product_title': product['title'],
+            'api_version': '2024-10',
             'test_results': results
         })
         

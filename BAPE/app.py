@@ -1887,22 +1887,105 @@ def api_test_single_upload():
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
 
 
+@app.route('/api/test_category')
+def api_test_category():
+    """測試設定商品 Category"""
+    try:
+        # 先取得一個 BAPE 商品
+        products = fetch_bape_product_ids()
+        if not products:
+            return jsonify({'error': '沒有 BAPE 商品'})
+        
+        product = products[0]
+        product_id = product['id']
+        
+        # 嘗試不同的 taxonomy node ID
+        # Apparel & Accessories 的標準 ID
+        test_ids = [
+            "gid://shopify/ProductTaxonomyNode/1",
+            "gid://shopify/ProductTaxonomyNode/166",  # Apparel & Accessories
+            "gid://shopify/ProductTaxonomyNode/212",  # Clothing
+        ]
+        
+        results = []
+        
+        for node_id in test_ids:
+            mutation = """mutation productUpdate($input: ProductInput!) {
+                productUpdate(input: $input) {
+                    product {
+                        id
+                        title
+                        productCategory {
+                            productTaxonomyNode {
+                                id
+                                name
+                                fullName
+                            }
+                        }
+                    }
+                    userErrors {
+                        field
+                        message
+                    }
+                }
+            }"""
+            
+            result = graphql_request(mutation, {
+                "input": {
+                    "id": product_id,
+                    "productCategory": {
+                        "productTaxonomyNodeId": node_id
+                    }
+                }
+            })
+            
+            results.append({
+                'tried_id': node_id,
+                'result': result
+            })
+            
+            # 如果成功了，停止
+            user_errors = result.get('data', {}).get('productUpdate', {}).get('userErrors', [])
+            if not user_errors:
+                product_cat = result.get('data', {}).get('productUpdate', {}).get('product', {}).get('productCategory')
+                if product_cat:
+                    results.append({'success': True, 'working_id': node_id, 'category': product_cat})
+                    break
+        
+        return jsonify({
+            'product_id': product_id,
+            'product_title': product['title'],
+            'test_results': results
+        })
+        
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
+
+
 @app.route('/api/check_taxonomy')
 def api_check_taxonomy():
     """查詢 Shopify 商品分類 ID"""
     try:
-        # 查詢 Apparel & Accessories
+        # 直接查詢特定的 taxonomy node
         query = """query {
-            taxonomy {
-                categories(first: 20, query: "Apparel") {
-                    edges {
-                        node {
-                            id
-                            name
-                            fullName
-                        }
-                    }
-                }
+            node1: productTaxonomyNode(id: "gid://shopify/ProductTaxonomyNode/1") {
+                id
+                name
+                fullName
+                isRoot
+            }
+            node166: productTaxonomyNode(id: "gid://shopify/ProductTaxonomyNode/166") {
+                id
+                name
+                fullName
+                isRoot
+            }
+            node212: productTaxonomyNode(id: "gid://shopify/ProductTaxonomyNode/212") {
+                id
+                name
+                fullName
+                isRoot
             }
         }"""
         

@@ -40,6 +40,10 @@ SHIPPING_RATE_PER_KG = int(os.getenv("SHIPPING_RATE_PER_KG", "1250"))  # 每公�
 MARGIN_DIVISOR = float(os.getenv("MARGIN_DIVISOR", "0.7"))  # 利潤除數（÷0.7 = 約43%利潤）
 SCRAPE_DELAY = float(os.getenv("SCRAPE_DELAY", "2.0"))  # 每次請求間隔(秒)
 
+# Proxy 設定（解決雲端 IP 被 BEAMS 封鎖的問題）
+# 格式: http://user:pass@host:port 或 socks5://user:pass@host:port
+PROXY_URL = os.getenv("PROXY_URL", "")  # 留空 = 不使用 proxy
+
 BASE_URL = "https://www.beams.co.jp"
 CDN_URL = "https://cdn.beams.co.jp"
 
@@ -76,23 +80,40 @@ CATEGORIES = {
 }
 
 # ============================================================
-# HTTP Session（模擬瀏覽器）
+# HTTP Session（模擬瀏覽器 + Proxy 支援）
 # ============================================================
 
 def create_session() -> requests.Session:
-    """建立帶有合理 Headers 的 Session"""
+    """建立帶有合理 Headers 的 Session，支援 Proxy"""
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/122.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ja-JP,ja;q=0.9,zh-TW;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ja,ja-JP;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
     })
+
+    # 設定 Proxy
+    if PROXY_URL:
+        session.proxies = {
+            "http": PROXY_URL,
+            "https": PROXY_URL,
+        }
+        logger.info(f"🌐 使用 Proxy: {PROXY_URL.split('@')[-1] if '@' in PROXY_URL else PROXY_URL}")
+    else:
+        logger.warning("⚠️ 未設定 PROXY_URL — 雲端 IP 可能被 BEAMS 封鎖！")
+
     return session
 
 
@@ -142,7 +163,7 @@ def _translate_openai(text: str) -> str:
                 "temperature": 0.3,
                 "max_tokens": 1000,
             },
-            timeout=15,
+            timeout=30,
         )
         resp.raise_for_status()
         result = resp.json()["choices"][0]["message"]["content"].strip()
@@ -281,7 +302,7 @@ class BeamsScraper:
             logger.info(f"  📄 正在爬取第 {page} 頁... URL: {full_url}")
 
             try:
-                resp = self.session.get(url, params=params, timeout=15)
+                resp = self.session.get(url, params=params, timeout=30)
                 resp.raise_for_status()
                 logger.debug(f"  📡 HTTP {resp.status_code}, 內容長度: {len(resp.text)} bytes")
             except requests.RequestException as e:
@@ -395,7 +416,7 @@ class BeamsScraper:
         logger.info(f"  🔍 爬取商品詳情: {item['item_code']}")
 
         try:
-            resp = self.session.get(url, timeout=15)
+            resp = self.session.get(url, timeout=30)
             resp.raise_for_status()
         except requests.RequestException as e:
             logger.error(f"  ❌ 商品詳情請求失敗: {e}")
@@ -533,7 +554,7 @@ class ShopifyUploader:
         params = {"limit": 250, "fields": "id,variants"}
 
         while url:
-            resp = requests.get(url, headers=self.headers, params=params, timeout=15)
+            resp = requests.get(url, headers=self.headers, params=params, timeout=30)
             resp.raise_for_status()
             data = resp.json()
 
@@ -672,7 +693,7 @@ class ShopifyUploader:
                 f"{self.api_base}/products.json",
                 headers=self.headers,
                 params={"fields": "id,variants", "limit": 1},
-                timeout=15,
+                timeout=30,
             )
             # 這裡簡化處理，實際應用建議用 metafield 查詢
             # 或維護一個本地 mapping 資料庫

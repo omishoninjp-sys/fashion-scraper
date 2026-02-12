@@ -108,6 +108,10 @@ DASHBOARD_HTML = """
         <div class="label">跳過重複</div>
       </div>
     </div>
+    <div style="margin-top:15px; padding-top:15px; border-top:1px solid #eee;">
+      <button onclick="testConnection()" id="btn-test" style="background:#2196F3; color:white; border:none; padding:8px 20px; border-radius:6px; cursor:pointer; font-size:14px;">🔌 測試 BEAMS 連線</button>
+      <span id="test-result" style="margin-left:12px; font-size:14px;"></span>
+    </div>
   </div>
 
   <!-- 快速價格計算 -->
@@ -276,6 +280,26 @@ async function runScraper(dryRun) {
 }
 
 renderCategories();
+
+async function testConnection() {
+  const btn = document.getElementById('btn-test');
+  const result = document.getElementById('test-result');
+  btn.disabled = true;
+  result.textContent = '⏳ 測試連線中...';
+  try {
+    const resp = await fetch('/api/test-connection');
+    const data = await resp.json();
+    result.textContent = data.message;
+    if (data.proxy_configured) {
+      result.textContent += ` (Proxy: ${data.proxy_host})`;
+    } else {
+      result.textContent += ' (無 Proxy)';
+    }
+  } catch(e) {
+    result.textContent = '❌ API 錯誤: ' + e.message;
+  }
+  btn.disabled = false;
+}
 </script>
 </body>
 </html>
@@ -349,6 +373,37 @@ def api_categories():
 def api_status():
     """取得爬蟲狀態"""
     return jsonify(scrape_status)
+
+
+@app.route("/api/test-connection")
+def api_test_connection():
+    """測試能否連接 BEAMS（檢查 proxy 是否正常）"""
+    from scraper import create_session, PROXY_URL, BASE_URL
+    session = create_session()
+    result = {
+        "proxy_configured": bool(PROXY_URL),
+        "proxy_host": PROXY_URL.split("@")[-1] if "@" in PROXY_URL else (PROXY_URL or "無"),
+    }
+    try:
+        resp = session.get(f"{BASE_URL}/category/t-shirt/?sex=M", timeout=30)
+        result["status_code"] = resp.status_code
+        result["content_length"] = len(resp.text)
+        result["has_products"] = "/item/" in resp.text
+        product_count = resp.text.count("/item/")
+        result["item_link_count"] = product_count
+        result["success"] = resp.status_code == 200 and product_count > 0
+
+        if result["success"]:
+            result["message"] = f"✅ 連線成功！偵測到 {product_count} 個商品連結"
+        elif resp.status_code == 200:
+            result["message"] = "⚠️ HTTP 200 但找不到商品連結（可能被重導或封鎖）"
+        else:
+            result["message"] = f"❌ HTTP {resp.status_code}"
+    except Exception as e:
+        result["success"] = False
+        result["message"] = f"❌ 連線失敗: {str(e)}"
+
+    return jsonify(result)
 
 
 @app.route("/api/translate", methods=["POST"])

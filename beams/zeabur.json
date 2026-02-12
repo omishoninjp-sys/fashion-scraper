@@ -19,6 +19,10 @@
           "description": "Shopify Admin API Access Token",
           "required": true
         },
+        "PROXY_URL": {
+          "description": "HTTP/SOCKS5 Proxy（解決雲端IP被封鎖），格式: http://user:pass@host:port",
+          "required": false
+        },
         "OPENAI_API_KEY": {
           "description": "OpenAI API Key（ChatGPT 翻譯用）",
           "required": true

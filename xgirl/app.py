@@ -9,6 +9,7 @@ X-girl 商品爬蟲 + Shopify 上架工具
 5. 無庫存商品不上架，已上架但無庫存的設為草稿
 6. 價格同步：已存在商品若價格變動則自動更新
 7. Collection 建立後發布到所有 channels
+8. 一鍵刪除 X-girl Collection 內所有商品（不影響其他 Collection）
 """
 
 from flask import Flask, jsonify
@@ -52,6 +53,16 @@ scrape_status = {
     "out_of_stock": 0,
     "set_to_draft": 0,
     "price_updated": 0
+}
+
+delete_status = {
+    "running": False,
+    "progress": 0,
+    "total": 0,
+    "current_product": "",
+    "deleted": 0,
+    "errors": [],
+    "finished": False
 }
 
 
@@ -247,7 +258,6 @@ def get_collection_products_with_details(collection_id):
                     variant_id = v.get('id')
                     cost = None
                     
-                    # 額外取得 variant 的 cost（collection products API 不含 cost）
                     variant_response = requests.get(
                         shopify_api_url(f"variants/{variant_id}.json"),
                         headers=get_shopify_headers()
@@ -255,7 +265,7 @@ def get_collection_products_with_details(collection_id):
                     if variant_response.status_code == 200:
                         variant_data = variant_response.json().get('variant', {})
                         cost = variant_data.get('cost')
-                    time.sleep(0.1)  # 避免 API 限制
+                    time.sleep(0.1)
                     
                     variants_info.append({
                         'variant_id': variant_id,
@@ -280,6 +290,67 @@ def get_collection_products_with_details(collection_id):
     
     print(f"[INFO] Collection 內有 {len(products_map)} 個商品")
     return products_map
+
+
+def get_collection_product_ids(collection_id):
+    """取得 Collection 內所有商品的 ID 和標題（輕量版，只用於刪除）"""
+    products = []
+    if not collection_id:
+        return products
+    
+    url = shopify_api_url(f"collections/{collection_id}/products.json?limit=250&fields=id,title,handle")
+    
+    while url:
+        response = requests.get(url, headers=get_shopify_headers())
+        if response.status_code != 200:
+            print(f"[ERROR] 取得 Collection 商品失敗: {response.status_code}")
+            break
+        
+        data = response.json()
+        for product in data.get('products', []):
+            products.append({
+                'id': product.get('id'),
+                'title': product.get('title', ''),
+                'handle': product.get('handle', '')
+            })
+        
+        link_header = response.headers.get('Link', '')
+        if 'rel="next"' in link_header:
+            match = re.search(r'<([^>]+)>; rel="next"', link_header)
+            url = match.group(1) if match else None
+        else:
+            url = None
+    
+    return products
+
+
+def delete_product(product_id):
+    """刪除單一商品"""
+    url = shopify_api_url(f"products/{product_id}.json")
+    response = requests.delete(url, headers=get_shopify_headers())
+    return response.status_code == 200
+
+
+def delete_collection(collection_id):
+    """刪除 Collection 本身"""
+    url = shopify_api_url(f"custom_collections/{collection_id}.json")
+    response = requests.delete(url, headers=get_shopify_headers())
+    return response.status_code == 200
+
+
+def find_collection_id(collection_title="X-girl"):
+    """尋找指定名稱的 Collection ID"""
+    response = requests.get(
+        shopify_api_url(f'custom_collections.json?title={collection_title}'),
+        headers=get_shopify_headers()
+    )
+    
+    if response.status_code == 200:
+        collections = response.json().get('custom_collections', [])
+        for col in collections:
+            if col['title'] == collection_title:
+                return col['id']
+    return None
 
 
 def set_product_to_draft(product_id):
@@ -527,7 +598,6 @@ def update_product_prices(source_product, existing_product_info):
     
     updated = False
     
-    # 建立 existing variants 的查找表（用 option1+option2+option3 作為 key）
     existing_variant_map = {}
     for ev in existing_variants:
         key = f"{ev.get('option1', '')}|{ev.get('option2', '')}|{ev.get('option3', '')}"
@@ -539,23 +609,17 @@ def update_product_prices(source_product, existing_product_info):
         if key in existing_variant_map:
             ev = existing_variant_map[key]
             
-            # 官網價格（進貨成本）
             source_cost = float(sv.get('price', 0))
-            
-            # Shopify 現有成本價
             shopify_cost = float(ev.get('cost', 0)) if ev.get('cost') else 0
             
-            # 比對：官網價格 vs Shopify 成本價
-            if abs(source_cost - shopify_cost) >= 1:  # 成本價差異 >= 1 才更新
+            if abs(source_cost - shopify_cost) >= 1:
                 variant_id = ev['variant_id']
                 
-                # 重新計算售價
                 weight = float(sv.get('grams', 0)) / 1000 if sv.get('grams') else DEFAULT_WEIGHT
                 new_selling_price = calculate_selling_price(source_cost, weight)
                 
                 print(f"[價格更新] Variant {variant_id}: 成本 ¥{shopify_cost} -> ¥{source_cost}, 售價更新為 ¥{new_selling_price}")
                 
-                # 更新價格和成本
                 response = requests.put(
                     shopify_api_url(f"variants/{variant_id}.json"),
                     headers=get_shopify_headers(),
@@ -591,7 +655,6 @@ def upload_to_shopify(source_product, collection_id=None):
     else:
         print(f"[翻譯失敗] 使用原文")
     
-    # 處理選項（Options）
     options = []
     for opt in source_product.get('options', []):
         options.append({
@@ -599,7 +662,6 @@ def upload_to_shopify(source_product, collection_id=None):
             'values': opt.get('values', [])
         })
     
-    # 處理 Variants
     variants = []
     source_variants = source_product.get('variants', [])
     
@@ -633,7 +695,6 @@ def upload_to_shopify(source_product, collection_id=None):
             'image_id': sv.get('image_id'),
         })
     
-    # 處理圖片
     source_images = source_product.get('images', [])
     images_base64 = []
     image_id_to_position = {}
@@ -723,7 +784,6 @@ def upload_to_shopify(source_product, collection_id=None):
         
         print(f"[DEBUG] 商品建立成功: ID={product_id}, Variants={len(created_variants)}, Images={len(created_images)}")
         
-        # 更新每個 variant 的 cost
         for idx, cv in enumerate(created_variants):
             if idx < len(variants):
                 cost = variants[idx]['cost']
@@ -733,7 +793,6 @@ def upload_to_shopify(source_product, collection_id=None):
                     json={'variant': {'id': cv['id'], 'cost': f"{cost:.2f}"}}
                 )
         
-        # 圖片與 Variant 對應
         source_to_created_variant = {}
         for idx, sv in enumerate(source_variants):
             if idx < len(created_variants):
@@ -771,6 +830,82 @@ def upload_to_shopify(source_product, collection_id=None):
         return {'success': False, 'error': response.text}
 
 
+# ========== 刪除功能 ==========
+
+def run_delete_collection(delete_collection_too=True):
+    """背景執行：刪除 X-girl Collection 內所有商品"""
+    global delete_status
+    
+    try:
+        delete_status = {
+            "running": True,
+            "progress": 0,
+            "total": 0,
+            "current_product": "",
+            "deleted": 0,
+            "errors": [],
+            "finished": False
+        }
+        
+        delete_status['current_product'] = "正在尋找 X-girl Collection..."
+        collection_id = find_collection_id("X-girl")
+        
+        if not collection_id:
+            delete_status['current_product'] = "找不到 X-girl Collection"
+            delete_status['errors'].append("找不到 X-girl Collection")
+            return
+        
+        print(f"[刪除] 找到 Collection ID: {collection_id}")
+        
+        delete_status['current_product'] = "正在取得 Collection 內所有商品..."
+        products = get_collection_product_ids(collection_id)
+        delete_status['total'] = len(products)
+        
+        print(f"[刪除] Collection 內共 {len(products)} 個商品")
+        
+        if not products:
+            delete_status['current_product'] = "Collection 內沒有商品"
+            return
+        
+        for idx, product in enumerate(products):
+            product_id = product['id']
+            title = product['title']
+            
+            delete_status['progress'] = idx + 1
+            delete_status['current_product'] = f"刪除中: {title[:40]}"
+            
+            print(f"[刪除] ({idx+1}/{len(products)}) 刪除: {title}")
+            
+            if delete_product(product_id):
+                delete_status['deleted'] += 1
+                print(f"[刪除] ✓ 成功刪除: {title}")
+            else:
+                delete_status['errors'].append(f"刪除失敗: {title} (ID: {product_id})")
+                print(f"[刪除] ✗ 刪除失敗: {title}")
+            
+            time.sleep(0.5)  # 避免 API 限制
+        
+        # 刪除 Collection 本身
+        if delete_collection_too:
+            delete_status['current_product'] = "正在刪除 Collection..."
+            if delete_collection(collection_id):
+                print(f"[刪除] ✓ Collection 已刪除")
+            else:
+                print(f"[刪除] ✗ Collection 刪除失敗")
+                delete_status['errors'].append("Collection 本身刪除失敗")
+        
+        delete_status['current_product'] = f"完成！共刪除 {delete_status['deleted']} 個商品"
+        
+    except Exception as e:
+        print(f"[ERROR] 刪除過程發生錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+        delete_status['errors'].append(str(e))
+    finally:
+        delete_status['running'] = False
+        delete_status['finished'] = True
+
+
 # ========== Flask 路由 ==========
 
 @app.route('/')
@@ -793,14 +928,26 @@ def index():
         .btn:hover {{ background: #FF1493; }}
         .btn:disabled {{ background: #ccc; cursor: not-allowed; }}
         .btn-secondary {{ background: #3498db; }}
+        .btn-danger {{ background: #e74c3c; }}
+        .btn-danger:hover {{ background: #c0392b; }}
         .progress-bar {{ width: 100%; height: 20px; background: #eee; border-radius: 10px; overflow: hidden; margin: 10px 0; }}
         .progress-fill {{ height: 100%; background: linear-gradient(90deg, #FF69B4, #FFB6C1); transition: width 0.3s; }}
+        .progress-fill-red {{ height: 100%; background: linear-gradient(90deg, #e74c3c, #e67e22); transition: width 0.3s; }}
         .status {{ padding: 10px; background: #f8f9fa; border-radius: 5px; margin-top: 10px; }}
         .log {{ max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 13px; background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 5px; }}
         .stats {{ display: flex; gap: 15px; margin-top: 15px; flex-wrap: wrap; }}
         .stat {{ flex: 1; min-width: 80px; text-align: center; padding: 15px; background: #f8f9fa; border-radius: 5px; }}
         .stat-number {{ font-size: 24px; font-weight: bold; color: #FF69B4; }}
         .stat-label {{ font-size: 11px; color: #666; margin-top: 5px; }}
+        .danger-zone {{ border: 2px solid #e74c3c; border-radius: 8px; padding: 20px; margin-bottom: 20px; background: #fff5f5; }}
+        .danger-zone h3 {{ color: #e74c3c; margin-top: 0; }}
+        .confirm-dialog {{ display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; }}
+        .confirm-dialog.active {{ display: flex; }}
+        .confirm-box {{ background: white; border-radius: 12px; padding: 30px; max-width: 450px; width: 90%; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,0.3); }}
+        .confirm-box h3 {{ color: #e74c3c; margin-bottom: 10px; }}
+        .confirm-box p {{ color: #666; margin-bottom: 20px; }}
+        .confirm-box .confirm-count {{ font-size: 36px; font-weight: bold; color: #e74c3c; margin: 15px 0; }}
+        .confirm-box .btn {{ margin: 5px; }}
     </style>
 </head>
 <body>
@@ -858,6 +1005,51 @@ def index():
         </div>
     </div>
     
+    <!-- 刪除功能區塊 -->
+    <div class="danger-zone">
+        <h3>⚠️ 危險操作 - 刪除 X-girl 全部商品</h3>
+        <p style="color: #666; font-size: 14px;">此操作會刪除 <strong>X-girl Collection 內的所有商品</strong>及 Collection 本身。</p>
+        <p style="color: #e74c3c; font-size: 14px; font-weight: bold;">⚠ 只會刪除 X-girl Collection 內的商品，不會影響其他 Collection 的商品。</p>
+        <p style="color: #666; font-size: 14px;">⚠ 此操作不可復原，請確認後再執行。</p>
+        <button class="btn btn-danger" id="deleteBtn" onclick="confirmDelete()">🗑️ 刪除 X-girl 全部商品</button>
+        
+        <div id="deleteProgressSection" style="display: none; margin-top: 15px;">
+            <div class="progress-bar">
+                <div class="progress-fill-red" id="deleteProgressFill" style="width: 0%"></div>
+            </div>
+            <div class="status" id="deleteStatusText">準備中...</div>
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-number" id="deletedCount" style="color: #e74c3c;">0</div>
+                    <div class="stat-label">已刪除</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number" id="deleteTotalCount">0</div>
+                    <div class="stat-label">總計</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number" id="deleteErrorCount">0</div>
+                    <div class="stat-label">錯誤</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 確認彈窗 -->
+    <div class="confirm-dialog" id="confirmDialog">
+        <div class="confirm-box">
+            <h3>⚠️ 確認刪除</h3>
+            <p>即將刪除 X-girl Collection 內的所有商品</p>
+            <div class="confirm-count" id="confirmCount">讀取中...</div>
+            <p>個商品將被永久刪除</p>
+            <p style="color: #e74c3c; font-size: 13px;">此操作不可復原！</p>
+            <div>
+                <button class="btn btn-danger" onclick="executeDelete()">確認刪除</button>
+                <button class="btn btn-secondary" onclick="cancelDelete()">取消</button>
+            </div>
+        </div>
+    </div>
+    
     <div class="card">
         <h3>執行日誌</h3>
         <div class="log" id="logArea">等待開始...</div>
@@ -865,14 +1057,17 @@ def index():
 
     <script>
         let pollInterval = null;
+        let deletePollInterval = null;
+        
         function log(msg, type = '') {{
             const logArea = document.getElementById('logArea');
             const time = new Date().toLocaleTimeString();
-            const color = type === 'success' ? '#4ec9b0' : type === 'error' ? '#f14c4c' : '#d4d4d4';
+            const color = type === 'success' ? '#4ec9b0' : type === 'error' ? '#f14c4c' : type === 'warning' ? '#e67e22' : '#d4d4d4';
             logArea.innerHTML += '<div style="color:' + color + '">[' + time + '] ' + msg + '</div>';
             logArea.scrollTop = logArea.scrollHeight;
         }}
         function clearLog() {{ document.getElementById('logArea').innerHTML = ''; }}
+        
         async function testShopify() {{
             log('測試 Shopify 連線...');
             try {{
@@ -882,6 +1077,7 @@ def index():
                 else log('✗ 連線失敗: ' + data.error, 'error');
             }} catch (e) {{ log('✗ 請求失敗: ' + e.message, 'error'); }}
         }}
+        
         async function startScrape() {{
             clearLog(); log('開始爬取流程...');
             document.getElementById('startBtn').disabled = true;
@@ -894,6 +1090,7 @@ def index():
                 pollInterval = setInterval(pollStatus, 1000);
             }} catch (e) {{ log('✗ ' + e.message, 'error'); document.getElementById('startBtn').disabled = false; }}
         }}
+        
         async function pollStatus() {{
             try {{
                 const res = await fetch('/api/status');
@@ -912,6 +1109,90 @@ def index():
                     clearInterval(pollInterval);
                     document.getElementById('startBtn').disabled = false;
                     log('========== 爬取完成 ==========', 'success');
+                }}
+            }} catch (e) {{ console.error(e); }}
+        }}
+        
+        // ===== 刪除功能 =====
+        async function confirmDelete() {{
+            log('正在確認 X-girl Collection 商品數量...', 'warning');
+            document.getElementById('deleteBtn').disabled = true;
+            
+            try {{
+                const res = await fetch('/api/delete-collection/preview');
+                const data = await res.json();
+                
+                if (!data.success) {{
+                    log('✗ ' + data.error, 'error');
+                    document.getElementById('deleteBtn').disabled = false;
+                    return;
+                }}
+                
+                document.getElementById('confirmCount').textContent = data.product_count;
+                document.getElementById('confirmDialog').classList.add('active');
+                
+                if (data.product_count === 0) {{
+                    log('Collection 內沒有商品', 'warning');
+                    document.getElementById('deleteBtn').disabled = false;
+                    cancelDelete();
+                    return;
+                }}
+                
+                log('找到 ' + data.product_count + ' 個商品待刪除', 'warning');
+            }} catch (e) {{
+                log('✗ ' + e.message, 'error');
+                document.getElementById('deleteBtn').disabled = false;
+            }}
+        }}
+        
+        function cancelDelete() {{
+            document.getElementById('confirmDialog').classList.remove('active');
+            document.getElementById('deleteBtn').disabled = false;
+        }}
+        
+        async function executeDelete() {{
+            document.getElementById('confirmDialog').classList.remove('active');
+            document.getElementById('deleteProgressSection').style.display = 'block';
+            
+            log('⚠️ 開始刪除 X-girl Collection 所有商品...', 'warning');
+            
+            try {{
+                const res = await fetch('/api/delete-collection', {{ method: 'POST' }});
+                const data = await res.json();
+                
+                if (!data.success) {{
+                    log('✗ ' + data.error, 'error');
+                    document.getElementById('deleteBtn').disabled = false;
+                    return;
+                }}
+                
+                log('✓ 刪除任務已啟動', 'warning');
+                deletePollInterval = setInterval(pollDeleteStatus, 1000);
+            }} catch (e) {{
+                log('✗ ' + e.message, 'error');
+                document.getElementById('deleteBtn').disabled = false;
+            }}
+        }}
+        
+        async function pollDeleteStatus() {{
+            try {{
+                const res = await fetch('/api/delete-collection/status');
+                const data = await res.json();
+                const percent = data.total > 0 ? (data.progress / data.total * 100) : 0;
+                document.getElementById('deleteProgressFill').style.width = percent + '%';
+                document.getElementById('deleteStatusText').textContent = data.current_product + ' (' + data.progress + '/' + data.total + ')';
+                document.getElementById('deletedCount').textContent = data.deleted;
+                document.getElementById('deleteTotalCount').textContent = data.total;
+                document.getElementById('deleteErrorCount').textContent = data.errors.length;
+                
+                if (data.finished) {{
+                    clearInterval(deletePollInterval);
+                    document.getElementById('deleteBtn').disabled = false;
+                    log('========== 刪除完成 ==========', 'success');
+                    log('共刪除 ' + data.deleted + ' 個商品', 'success');
+                    if (data.errors.length > 0) {{
+                        log('有 ' + data.errors.length + ' 個錯誤', 'error');
+                    }}
                 }}
             }} catch (e) {{ console.error(e); }}
         }}
@@ -975,7 +1256,6 @@ def run_scrape():
         scrape_status['total'] = len(product_list)
         print(f"[INFO] 找到 {len(product_list)} 個商品")
         
-        # 記錄有庫存的商品 handle
         in_stock_handles = set()
         
         for idx, product in enumerate(product_list):
@@ -985,18 +1265,15 @@ def run_scrape():
             my_handle = f"xgirl-{handle}"
             scrape_status['current_product'] = f"處理中: {title[:30]}"
             
-            # 檢查庫存
             has_stock = check_product_stock(product)
             
             if has_stock:
                 in_stock_handles.add(my_handle)
             
-            # 檢查是否已存在
             if my_handle in existing_handles:
                 existing_info = collection_products_map[my_handle]
                 
                 if has_stock:
-                    # 已存在且有庫存 -> 檢查並更新價格
                     scrape_status['current_product'] = f"檢查價格: {title[:30]}"
                     if update_product_prices(product, existing_info):
                         print(f"[價格同步] {title}")
@@ -1010,7 +1287,6 @@ def run_scrape():
                     scrape_status['skipped'] += 1
                 continue
             
-            # 檢查最低價格
             variants = product.get('variants', [])
             if variants:
                 min_price = min(float(v.get('price', 0)) for v in variants)
@@ -1023,7 +1299,6 @@ def run_scrape():
                 scrape_status['skipped'] += 1
                 continue
             
-            # 檢查庫存（新商品）
             if not has_stock:
                 print(f"[跳過] 無庫存: {title}")
                 scrape_status['out_of_stock'] += 1
@@ -1036,7 +1311,7 @@ def run_scrape():
                 translated_title = result.get('translated', {}).get('title', title)
                 variants_count = result.get('variants_count', 0)
                 print(f"[成功] {translated_title} ({variants_count} variants)")
-                existing_handles.add(my_handle)  # 防止同一批次重複上架
+                existing_handles.add(my_handle)
                 scrape_status['uploaded'] += 1
                 scrape_status['products'].append({
                     'handle': handle,
@@ -1055,7 +1330,6 @@ def run_scrape():
             
             time.sleep(1)
         
-        # 設為草稿：已存在但現在無庫存或官網下架的商品
         scrape_status['current_product'] = "正在檢查需要設為草稿的商品..."
         
         for my_handle, product_info in collection_products_map.items():
@@ -1075,6 +1349,54 @@ def run_scrape():
         scrape_status['errors'].append({'error': str(e)})
     finally:
         scrape_status['running'] = False
+
+
+# ========== 刪除 API 路由 ==========
+
+@app.route('/api/delete-collection/preview')
+def delete_collection_preview():
+    """預覽：取得 X-girl Collection 內的商品數量"""
+    if not load_shopify_token():
+        return jsonify({'success': False, 'error': '環境變數未設定'})
+    
+    collection_id = find_collection_id("X-girl")
+    if not collection_id:
+        return jsonify({'success': False, 'error': '找不到 X-girl Collection'})
+    
+    products = get_collection_product_ids(collection_id)
+    
+    return jsonify({
+        'success': True,
+        'collection_id': collection_id,
+        'product_count': len(products),
+        'products': [{'id': p['id'], 'title': p['title']} for p in products[:20]]  # 最多顯示前 20 個
+    })
+
+
+@app.route('/api/delete-collection/status')
+def delete_collection_status():
+    """取得刪除進度"""
+    return jsonify(delete_status)
+
+
+@app.route('/api/delete-collection', methods=['POST'])
+def api_delete_collection():
+    """一鍵刪除 X-girl Collection 內所有商品"""
+    global delete_status
+    
+    if delete_status.get('running'):
+        return jsonify({'success': False, 'error': '刪除正在進行中'})
+    
+    if scrape_status.get('running'):
+        return jsonify({'success': False, 'error': '爬取正在進行中，請等待完成後再刪除'})
+    
+    if not load_shopify_token():
+        return jsonify({'success': False, 'error': '環境變數未設定'})
+    
+    thread = threading.Thread(target=run_delete_collection)
+    thread.start()
+    
+    return jsonify({'success': True, 'message': '刪除任務已啟動'})
 
 
 @app.route('/api/test-shopify')

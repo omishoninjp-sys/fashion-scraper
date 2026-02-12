@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.zeabur.app/template.json",
+  "name": "BEAMS Scraper",
+  "description": "BEAMS 日本官網爬蟲 → Shopify 自動上架系統",
+  "services": [
+    {
+      "name": "beams-scraper",
+      "template": "PREBUILT",
+      "source": {
+        "image": "."
+      },
+      "env": {
+        "PORT": "8080",
+        "SHOPIFY_SHOP": {
+          "description": "Shopify 商店網址 (例: your-store.myshopify.com)",
+          "required": true
+        },
+        "SHOPIFY_ACCESS_TOKEN": {
+          "description": "Shopify Admin API Access Token",
+          "required": true
+        },
+        "PROXY_URL": {
+          "description": "HTTP/SOCKS5 Proxy（解決雲端IP被封鎖），格式: http://user:pass@host:port",
+          "required": false
+        },
+        "OPENAI_API_KEY": {
+          "description": "OpenAI API Key（ChatGPT 翻譯用）",
+          "required": true
+        },
+        "OPENAI_MODEL": {
+          "description": "翻譯用的 OpenAI 模型",
+          "default": "gpt-4o-mini"
+        },
+        "JPY_TO_TWD_RATE": {
+          "description": "日幣對台幣匯率",
+          "default": "0.22"
+        },
+        "PROXY_FEE_RATE": {
+          "description": "代購手續費率（0.15 = 15%）",
+          "default": "0.15"
+        },
+        "SHIPPING_BASE_JPY": {
+          "description": "基本國際運費（日幣）",
+          "default": "1500"
+        },
+        "SHIPPING_PER_ITEM_JPY": {
+          "description": "每件加收運費（日幣）",
+          "default": "500"
+        },
+        "SCRAPE_DELAY": {
+          "description": "爬蟲請求間隔秒數",
+          "default": "2.0"
+        }
+      },
+      "ports": [8080]
+    }
+  ]
+}

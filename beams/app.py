@@ -255,6 +255,15 @@ async function runScraper(dryRun) {
         }
         if (data.items.length > 20) text += `  ... 還有 ${data.items.length - 20} 件\\n`;
       }
+
+      // ========== DEBUG LOGS ==========
+      if (data.debug_logs && data.debug_logs.length > 0) {
+        text += '\\n━━━━━━━━ DEBUG LOGS ━━━━━━━━\\n';
+        for (const line of data.debug_logs) {
+          if (line.trim()) text += line + '\\n';
+        }
+      }
+
       resultBox.textContent = text;
     }
   } catch (e) {

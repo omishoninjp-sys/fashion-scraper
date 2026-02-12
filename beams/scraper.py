@@ -26,7 +26,7 @@ from typing import Optional
 # ============================================================
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # ← DEBUG 模式方便排查問題，正式上線改回 INFO
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
@@ -272,13 +272,18 @@ class BeamsScraper:
 
         while page <= max_pages:
             url = f"{BASE_URL}{cat['path']}"
-            params = {"sex": cat["sex"], "page": page}
+            # ⚠️ BEAMS 分頁參數是 "p" 不是 "page"
+            params = {"sex": cat["sex"]}
+            if page > 1:
+                params["p"] = page
 
-            logger.info(f"  📄 正在爬取第 {page} 頁...")
+            full_url = f"{url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+            logger.info(f"  📄 正在爬取第 {page} 頁... URL: {full_url}")
 
             try:
                 resp = self.session.get(url, params=params, timeout=15)
                 resp.raise_for_status()
+                logger.debug(f"  📡 HTTP {resp.status_code}, 內容長度: {len(resp.text)} bytes")
             except requests.RequestException as e:
                 logger.error(f"  ❌ 請求失敗: {e}")
                 break
@@ -303,43 +308,68 @@ class BeamsScraper:
         """解析分類頁面的商品列表"""
         items = []
 
-        # BEAMS 商品列表通常在 .item-list 或 .product-list 容器中
-        # 每個商品是一個 <a> 連結包含圖片和價格
-        # 實際選擇器需根據 HTML 結構調整
+        # ========== DEBUG: 頁面結構分析 ==========
+        page_title = soup.find("title")
+        logger.debug(f"  🔎 [DEBUG] 頁面標題: {page_title.text.strip() if page_title else '無'}")
+        logger.debug(f"  🔎 [DEBUG] HTML 總長度: {len(str(soup))} chars")
 
-        # 方法1: 找所有商品連結（匹配 /item/ 路徑）
-        product_links = soup.find_all("a", href=re.compile(r"/item/[^/]+/[^/]+/\d+/?"))
+        # 檢查所有 <a> 標籤中含 /item/ 的連結
+        all_a_tags = soup.find_all("a", href=True)
+        item_hrefs = [a["href"] for a in all_a_tags if "/item/" in a.get("href", "")]
+        logger.debug(f"  🔎 [DEBUG] 全部 <a> 標籤: {len(all_a_tags)} 個, 含 /item/ 連結: {len(item_hrefs)} 個")
+
+        if item_hrefs:
+            logger.debug(f"  🔎 [DEBUG] 前3個 /item/ 連結: {item_hrefs[:3]}")
+        else:
+            # 沒找到 /item/ 連結，輸出更多偵錯資訊
+            logger.warning(f"  ⚠️ [DEBUG] 頁面中找不到任何 /item/ 連結！")
+            # 輸出前幾個 <a> href 看看頁面結構
+            sample_hrefs = [a["href"] for a in all_a_tags[:10]]
+            logger.warning(f"  ⚠️ [DEBUG] 前10個 <a> href: {sample_hrefs}")
+            # 輸出 HTML 前 2000 字幫助除錯
+            html_snippet = str(soup)[:2000]
+            logger.warning(f"  ⚠️ [DEBUG] HTML 前 2000 字:\n{html_snippet}")
+
+        # ========== 商品列表解析 ==========
+        # BEAMS 商品連結格式: /item/{label}/{category}/{item_code}/?color=XX
+        product_links = soup.find_all("a", href=re.compile(r"/item/[^/]+/[^/]+/\d+"))
+
+        logger.debug(f"  🔎 [DEBUG] regex 匹配到的商品連結: {len(product_links)} 個")
 
         seen_codes = set()
         for link in product_links:
             href = link.get("href", "")
             # 提取商品編號
-            match = re.search(r"/item/([^/]+)/([^/]+)/(\d+)/?", href)
+            match = re.search(r"/item/([^/]+)/([^/]+)/(\d+)", href)
             if not match:
+                logger.debug(f"  🔎 [DEBUG] regex 無法匹配: {href}")
                 continue
 
             label = match.group(1)  # e.g., "beams", "beamsplus"
-            item_type = match.group(2)  # e.g., "pants", "bag"
-            item_code = match.group(3)  # e.g., "11243739585"
+            item_type = match.group(2)  # e.g., "t-shirt", "pants"
+            item_code = match.group(3)  # e.g., "11041456366"
 
             if item_code in seen_codes:
                 continue
             seen_codes.add(item_code)
 
             # 嘗試從列表頁取得基本資料
+            # 清理 href，移除 ?color= 參數
+            clean_href = re.sub(r"\?.*$", "/", href)
             item_data = {
                 "item_code": item_code,
                 "label": label,
                 "item_type": item_type,
-                "url": urljoin(BASE_URL, href),
+                "url": urljoin(BASE_URL, clean_href),
                 "category_name": category["name"],
                 "sex": category["sex"],
             }
 
-            # 嘗試取得價格文字
-            price_el = link.find(string=re.compile(r"[¥￥]\s*[\d,]+"))
-            if price_el:
-                price_text = re.sub(r"[^0-9]", "", str(price_el))
+            # 嘗試取得價格文字 — 從 <a> 的文字內容中搜尋
+            link_text = link.get_text()
+            price_match = re.search(r"[¥￥]\s*([\d,]+)", link_text)
+            if price_match:
+                price_text = price_match.group(1).replace(",", "")
                 if price_text:
                     item_data["price_jpy"] = int(price_text)
 
@@ -351,6 +381,11 @@ class BeamsScraper:
                     item_data["thumbnail"] = src if src.startswith("http") else f"https:{src}"
 
             items.append(item_data)
+
+        logger.info(f"  📋 [解析結果] 去重後商品數: {len(items)} 件（原始連結 {len(product_links)} 個）")
+        if items:
+            sample = items[0]
+            logger.info(f"  📋 [範例商品] code={sample['item_code']}, label={sample['label']}, price={sample.get('price_jpy', '未知')}")
 
         return items
 
@@ -721,6 +756,14 @@ def run_scraper(categories: list[str], max_pages: int = 3, dry_run: bool = False
         max_pages: 每個分類最多爬幾頁
         dry_run: True = 只爬不上架（測試用）
     """
+    # ========== 擷取 log 到記憶體，方便回傳給前端 ==========
+    import io
+    log_capture = io.StringIO()
+    log_handler = logging.StreamHandler(log_capture)
+    log_handler.setLevel(logging.DEBUG)
+    log_handler.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
+    logger.addHandler(log_handler)
+
     scraper = BeamsScraper()
     uploader = ShopifyUploader() if not dry_run else None
 
@@ -733,6 +776,7 @@ def run_scraper(categories: list[str], max_pages: int = 3, dry_run: bool = False
         "total_skipped_no_price": 0,
         "total_failed": 0,
         "items": [],
+        "debug_logs": [],  # ← 新增：回傳 debug logs 給前端
     }
 
     for cat_key in categories:
@@ -795,6 +839,11 @@ def run_scraper(categories: list[str], max_pages: int = 3, dry_run: bool = False
     logger.info(f"  跳過無價: {results['total_skipped_no_price']}")
     logger.info(f"  上架失敗: {results['total_failed']}")
     logger.info("=" * 60)
+
+    # ========== 擷取 debug logs ==========
+    logger.removeHandler(log_handler)
+    results["debug_logs"] = log_capture.getvalue().split("\n")
+    log_capture.close()
 
     return results
 

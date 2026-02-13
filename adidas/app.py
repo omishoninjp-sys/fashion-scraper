@@ -456,6 +456,18 @@ def api_test_price():
     })
 
 
+@app.route("/api/debug-screenshot")
+def api_debug_screenshot():
+    """提供 debug 截圖"""
+    import glob
+    from flask import send_file
+
+    screenshots = sorted(glob.glob("/tmp/adidas_debug_*.png"), reverse=True)
+    if screenshots:
+        return send_file(screenshots[0], mimetype="image/png")
+    return jsonify({"error": "沒有截圖"}), 404
+
+
 # ============================================================
 # 背景爬蟲執行
 # ============================================================

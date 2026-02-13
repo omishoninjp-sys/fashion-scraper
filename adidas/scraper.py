@@ -128,7 +128,7 @@ class AdidasScraper:
         self.page = None
 
     async def init_browser(self):
-        """啟動瀏覽器"""
+        """啟動瀏覽器（含反偵測）"""
         from playwright.async_api import async_playwright
 
         self.pw = await async_playwright().start()
@@ -139,6 +139,8 @@ class AdidasScraper:
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1920,1080",
             ],
         }
         if PROXY_URL:
@@ -150,10 +152,23 @@ class AdidasScraper:
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/122.0.0.0 Safari/537.36"
             ),
             locale="ja-JP",
+            timezone_id="Asia/Tokyo",
+            extra_http_headers={
+                "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            },
         )
+
+        # 反偵測: 移除 navigator.webdriver 標記
+        await self.context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['ja', 'en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            window.chrome = { runtime: {} };
+        """)
+
         self.page = await self.context.new_page()
 
     async def close_browser(self):
@@ -183,18 +198,45 @@ class AdidasScraper:
             logger.info(f"正在載入第 {page_num + 1} 頁: {url}")
 
             try:
-                await self.page.goto(url, wait_until="networkidle", timeout=60000)
+                await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                # 等久一點讓 JS 渲染完成
+                await self.page.wait_for_timeout(5000)
+
+                # 先嘗試關閉彈窗（可能擋住內容）
+                await self._close_popups()
+                await self.page.wait_for_timeout(2000)
+
                 # 等待商品卡片出現
                 await self.page.wait_for_selector(
-                    '[data-testid="plp-product-card"]', timeout=15000
+                    '[data-testid="plp-product-card"]', timeout=20000
                 )
             except Exception as e:
-                logger.info(f"第 {page_num + 1} 頁無商品或載入失敗，結束分頁: {e}")
-                break
+                # 截圖 debug
+                screenshot_path = f"/tmp/adidas_debug_page{page_num + 1}.png"
+                try:
+                    await self.page.screenshot(path=screenshot_path, full_page=False)
+                    logger.info(f"📸 Debug 截圖已儲存: {screenshot_path}")
+                except Exception:
+                    pass
 
-            # 關閉彈窗（只在第一頁）
-            if page_num == 0:
-                await self._close_popups()
+                # 記錄頁面標題和 URL
+                try:
+                    page_title = await self.page.title()
+                    page_url = self.page.url
+                    page_text = await self.page.inner_text("body")
+                    logger.info(f"📄 頁面標題: {page_title}")
+                    logger.info(f"📄 頁面 URL: {page_url}")
+                    logger.info(f"📄 頁面前500字: {page_text[:500]}")
+                except Exception:
+                    pass
+
+                if page_num == 0:
+                    logger.error(f"第 1 頁載入失敗: {e}")
+                    # 第一頁失敗就不繼續了
+                    break
+                else:
+                    logger.info(f"第 {page_num + 1} 頁無商品，結束分頁")
+                    break
 
             # 滾動頁面確保所有商品都載入
             await self._scroll_page()

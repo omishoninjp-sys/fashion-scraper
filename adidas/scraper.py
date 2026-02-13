@@ -39,17 +39,20 @@ PROXY_URL = os.getenv("PROXY_URL", "")                  # 可選: http://user:pa
 # adidas.jp 分類 URL
 # ============================================================
 CATEGORIES = {
-    "men_shoes": {
-        "name": "男鞋",
-        "url": "https://www.adidas.jp/men-shoes",
-        "collection": "adidas 男鞋",
+    "men_originals": {
+        "name": "男鞋 Originals",
+        "url": "https://www.adidas.jp/%E3%83%A1%E3%83%B3%E3%82%BA-%E3%82%B7%E3%83%A5%E3%83%BC%E3%82%BA%E3%83%BB%E9%9D%B4-%E3%82%AA%E3%83%AA%E3%82%B8%E3%83%8A%E3%83%AB%E3%82%B9",
+        "collection": "adidas 男鞋 Originals",
     },
-    "women_shoes": {
-        "name": "女鞋",
-        "url": "https://www.adidas.jp/women-shoes",
-        "collection": "adidas 女鞋",
+    "women_originals": {
+        "name": "女鞋 Originals",
+        "url": "https://www.adidas.jp/%E3%83%AC%E3%83%87%E3%82%A3%E3%83%BC%E3%82%B9-%E3%82%B7%E3%83%A5%E3%83%BC%E3%82%BA%E3%83%BB%E9%9D%B4-%E3%82%AA%E3%83%AA%E3%82%B8%E3%83%8A%E3%83%AB%E3%82%B9",
+        "collection": "adidas 女鞋 Originals",
     },
 }
+
+# 分頁設定: 每頁 48 個商品
+ITEMS_PER_PAGE = 48
 
 BASE_URL = "https://www.adidas.jp"
 
@@ -160,69 +163,91 @@ class AdidasScraper:
         if self.pw:
             await self.pw.stop()
 
-    async def scrape_listing_page(self, category_url: str, max_pages: int = 5) -> list:
+    async def scrape_listing_page(self, category_url: str, max_pages: int = 0) -> list:
         """
-        爬取商品列表頁，回傳商品基本資訊列表
-        會自動滾動載入更多商品
+        爬取商品列表頁，使用 URL 分頁 (?start=0, 48, 96, ...)
+        max_pages=0 表示爬全部頁面
         """
         products = []
-        logger.info(f"正在載入列表頁: {category_url}")
+        page_num = 0
 
-        await self.page.goto(category_url, wait_until="networkidle", timeout=60000)
-        # 等待商品卡片出現
-        await self.page.wait_for_selector(
-            '[data-testid="plp-product-card"]', timeout=30000
-        )
+        while True:
+            # 組合分頁 URL
+            if page_num == 0:
+                url = category_url
+            else:
+                start = page_num * ITEMS_PER_PAGE
+                separator = "&" if "?" in category_url else "?"
+                url = f"{category_url}{separator}start={start}"
 
-        # 關閉可能出現的 cookie/popup 彈窗
-        await self._close_popups()
+            logger.info(f"正在載入第 {page_num + 1} 頁: {url}")
 
-        # 滾動載入更多商品
-        loaded_pages = 0
-        prev_count = 0
-        while loaded_pages < max_pages:
-            # 滾動到頁面底部
-            await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            try:
+                await self.page.goto(url, wait_until="networkidle", timeout=60000)
+                # 等待商品卡片出現
+                await self.page.wait_for_selector(
+                    '[data-testid="plp-product-card"]', timeout=15000
+                )
+            except Exception as e:
+                logger.info(f"第 {page_num + 1} 頁無商品或載入失敗，結束分頁: {e}")
+                break
+
+            # 關閉彈窗（只在第一頁）
+            if page_num == 0:
+                await self._close_popups()
+
+            # 滾動頁面確保所有商品都載入
+            await self._scroll_page()
+
+            # 解析商品卡片
+            cards = await self.page.query_selector_all('[data-testid="plp-product-card"]')
+            logger.info(f"  第 {page_num + 1} 頁找到 {len(cards)} 個商品")
+
+            if len(cards) == 0:
+                logger.info("沒有更多商品，結束分頁")
+                break
+
+            page_product_count = 0
+            for card in cards:
+                try:
+                    product = await self._parse_card(card)
+                    if product:
+                        # 避免重複（跨頁可能重複）
+                        if not any(p["sku"] == product["sku"] for p in products):
+                            products.append(product)
+                            page_product_count += 1
+                except Exception as e:
+                    logger.warning(f"解析商品卡片失敗: {e}")
+                    continue
+
+            logger.info(f"  第 {page_num + 1} 頁新增 {page_product_count} 個商品（累計 {len(products)} 個）")
+
+            # 如果這一頁商品數少於 ITEMS_PER_PAGE，代表是最後一頁
+            if len(cards) < ITEMS_PER_PAGE:
+                logger.info("已到最後一頁")
+                break
+
+            page_num += 1
+
+            # 檢查是否達到最大頁數限制
+            if max_pages > 0 and page_num >= max_pages:
+                logger.info(f"已達最大頁數限制 ({max_pages} 頁)")
+                break
+
+            # 頁間延遲
             await self.page.wait_for_timeout(2000)
 
-            # 嘗試點擊「載入更多」按鈕
-            try:
-                load_more = self.page.locator(
-                    'button:has-text("もっと見る"), button:has-text("LOAD MORE"), [data-testid="load-more"]'
-                )
-                if await load_more.count() > 0:
-                    await load_more.first.click()
-                    await self.page.wait_for_timeout(3000)
-            except Exception:
-                pass
-
-            # 計算目前的商品數量
-            cards = await self.page.query_selector_all(
-                '[data-testid="plp-product-card"]'
-            )
-            current_count = len(cards)
-            logger.info(f"  目前載入 {current_count} 個商品")
-
-            if current_count == prev_count:
-                # 沒有新商品了
-                break
-            prev_count = current_count
-            loaded_pages += 1
-
-        # 解析所有商品卡片
-        cards = await self.page.query_selector_all('[data-testid="plp-product-card"]')
-        logger.info(f"共找到 {len(cards)} 個商品卡片")
-
-        for card in cards:
-            try:
-                product = await self._parse_card(card)
-                if product:
-                    products.append(product)
-            except Exception as e:
-                logger.warning(f"解析商品卡片失敗: {e}")
-                continue
-
+        logger.info(f"總共找到 {len(products)} 個不重複商品")
         return products
+
+    async def _scroll_page(self):
+        """滾動頁面確保所有商品都載入"""
+        for _ in range(5):
+            await self.page.evaluate("window.scrollBy(0, window.innerHeight)")
+            await self.page.wait_for_timeout(500)
+        # 滾回頂部
+        await self.page.evaluate("window.scrollTo(0, 0)")
+        await self.page.wait_for_timeout(500)
 
     async def _parse_card(self, card) -> dict | None:
         """解析單個商品卡片"""

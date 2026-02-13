@@ -174,14 +174,14 @@ HTML_TEMPLATE = """
             <div class="control-group">
                 <label>分類</label>
                 <select id="category">
-                    <option value="men_shoes">男鞋</option>
-                    <option value="women_shoes">女鞋</option>
-                    <option value="all">全部（男鞋+女鞋）</option>
+                    <option value="men_originals">男鞋 Originals</option>
+                    <option value="women_originals">女鞋 Originals</option>
+                    <option value="all">全部</option>
                 </select>
             </div>
             <div class="control-group">
-                <label>最多頁數</label>
-                <input type="number" id="max-pages" value="5" min="1" max="20" style="width: 80px;">
+                <label>最多頁數 (0=全部)</label>
+                <input type="number" id="max-pages" value="0" min="0" max="50" style="width: 80px;">
             </div>
             <div class="control-group">
                 <label>爬取模式</label>
@@ -191,7 +191,8 @@ HTML_TEMPLATE = """
                 </select>
             </div>
             <button class="btn-primary" id="btn-start" onclick="startScrape()">🚀 開始爬取</button>
-            <button class="btn-test" onclick="testPrice()">🧮 測試定價</button>
+            <button class="btn-test" onclick="startTest()" id="btn-test">🧪 測試（只上1個）</button>
+            <button class="btn-test" onclick="testPrice()">🧮 定價計算</button>
         </div>
     </div>
 
@@ -247,6 +248,37 @@ function log(msg, isError = false) {
     const cls = isError ? ' class="error"' : '';
     el.innerHTML += `<div${cls}>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
     el.scrollTop = el.scrollHeight;
+}
+
+async function startTest() {
+    const category = document.getElementById('category').value;
+    document.getElementById('btn-start').disabled = true;
+    document.getElementById('btn-test').disabled = true;
+    document.getElementById('progress-section').style.display = 'block';
+    document.getElementById('product-list').style.display = 'block';
+    document.getElementById('product-items').innerHTML = '';
+    log(`🧪 測試模式: ${category} (只上架1個商品)`);
+
+    try {
+        const resp = await fetch('/api/start-scrape', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ category, max_pages: 1, mode: 'full', test_mode: true })
+        });
+        const data = await resp.json();
+        if (data.error) {
+            log(data.error, true);
+            document.getElementById('btn-start').disabled = false;
+            document.getElementById('btn-test').disabled = false;
+            return;
+        }
+        log(data.message);
+        startPolling();
+    } catch (e) {
+        log('啟動失敗: ' + e, true);
+        document.getElementById('btn-start').disabled = false;
+        document.getElementById('btn-test').disabled = false;
+    }
 }
 
 async function startScrape() {
@@ -320,6 +352,7 @@ function startPolling() {
             if (!s.running) {
                 clearInterval(pollInterval);
                 document.getElementById('btn-start').disabled = false;
+                document.getElementById('btn-test').disabled = false;
                 document.getElementById('progress-label').textContent = '✅ 完成';
                 document.getElementById('progress-bar').style.width = '100%';
                 log(`完成！上架: ${s.uploaded}, 跳過: ${s.skipped}, 失敗: ${s.failed}`);
@@ -370,9 +403,10 @@ def api_start_scrape():
         return jsonify({"error": "爬蟲正在執行中，請等待完成"})
 
     data = request.get_json() or {}
-    category = data.get("category", "men_shoes")
-    max_pages = data.get("max_pages", 5)
+    category = data.get("category", "men_originals")
+    max_pages = data.get("max_pages", 0)
     mode = data.get("mode", "full")
+    test_mode = data.get("test_mode", False)
 
     # 決定要爬的分類
     if category == "all":
@@ -400,13 +434,15 @@ def api_start_scrape():
     # 在背景線程中執行
     thread = threading.Thread(
         target=run_scrape_thread,
-        args=(cats, max_pages, mode),
+        args=(cats, max_pages, mode, test_mode),
         daemon=True,
     )
     thread.start()
 
     cat_names = ", ".join(CATEGORIES[c]["name"] for c in cats)
-    return jsonify({"message": f"開始爬取: {cat_names} (最多 {max_pages} 頁)"})
+    test_label = " [🧪 測試模式：只上1個]" if test_mode else ""
+    pages_label = "全部" if max_pages == 0 else f"最多 {max_pages}"
+    return jsonify({"message": f"開始爬取: {cat_names} ({pages_label} 頁){test_label}"})
 
 
 @app.route("/api/test-price")
@@ -423,12 +459,12 @@ def api_test_price():
 # ============================================================
 # 背景爬蟲執行
 # ============================================================
-def run_scrape_thread(categories: list, max_pages: int, mode: str):
+def run_scrape_thread(categories: list, max_pages: int, mode: str, test_mode: bool = False):
     """在背景線程中執行爬蟲"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(run_scrape_async(categories, max_pages, mode))
+        loop.run_until_complete(run_scrape_async(categories, max_pages, mode, test_mode))
     except Exception as e:
         logger.error(f"爬蟲執行錯誤: {e}")
         scrape_status["errors"].append(str(e))
@@ -438,7 +474,7 @@ def run_scrape_thread(categories: list, max_pages: int, mode: str):
         loop.close()
 
 
-async def run_scrape_async(categories: list, max_pages: int, mode: str):
+async def run_scrape_async(categories: list, max_pages: int, mode: str, test_mode: bool = False):
     """非同步爬蟲主流程"""
     global scrape_status
     scraper = AdidasScraper()
@@ -458,12 +494,19 @@ async def run_scrape_async(categories: list, max_pages: int, mode: str):
             scrape_status["current_product"] = f"爬取 {cat['name']} 列表頁..."
             logger.info(f"=== 開始爬取: {cat['name']} ===")
 
-            products = await scraper.scrape_listing_page(cat["url"], max_pages)
+            # 測試模式只爬第1頁
+            pages = 1 if test_mode else max_pages
+            products = await scraper.scrape_listing_page(cat["url"], pages)
             for p in products:
                 p["category"] = cat_key
                 p["collection_name"] = cat["collection"]
             all_products.extend(products)
             logger.info(f"{cat['name']} 找到 {len(products)} 個商品")
+
+        # 測試模式只處理第1個商品
+        if test_mode and len(all_products) > 0:
+            all_products = [all_products[0]]
+            logger.info("🧪 測試模式：只處理第 1 個商品")
 
         scrape_status["total"] = len(all_products)
         logger.info(f"共找到 {len(all_products)} 個商品")

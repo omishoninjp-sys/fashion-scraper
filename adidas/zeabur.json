@@ -1,0 +1,29 @@
+{
+  "build": {
+    "type": "dockerfile",
+    "dockerfile": "Dockerfile"
+  },
+  "env": {
+    "SHOPIFY_STORE": {
+      "description": "Shopify 商店名稱 (例如 goyoutati)",
+      "required": true
+    },
+    "SHOPIFY_ACCESS_TOKEN": {
+      "description": "Shopify Admin API Access Token",
+      "required": true
+    },
+    "OPENAI_API_KEY": {
+      "description": "OpenAI API Key (翻譯用，可選)",
+      "required": false
+    },
+    "PROXY_URL": {
+      "description": "代理伺服器 URL (可選，格式: http://user:pass@host:port)",
+      "required": false
+    },
+    "PORT": {
+      "description": "服務埠號",
+      "required": false,
+      "default": "5000"
+    }
+  }
+}

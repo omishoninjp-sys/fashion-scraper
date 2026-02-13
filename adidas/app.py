@@ -4,6 +4,7 @@ adidas.jp 爬蟲 Web 控制面板
 Flask app，提供 Web UI 操作爬蟲
 """
 
+import os
 import asyncio
 import threading
 import time

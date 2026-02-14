@@ -5,6 +5,22 @@ Flask app，提供 Web UI 操作爬蟲
 """
 
 import os
+
+# 載入 .env 檔案
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # 沒裝 dotenv 就手動讀 .env
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, val = line.split('=', 1)
+                    os.environ.setdefault(key.strip(), val.strip())
+
 import asyncio
 import threading
 import time
@@ -191,7 +207,11 @@ HTML_TEMPLATE = """
                 </select>
             </div>
             <button class="btn-primary" id="btn-start" onclick="startScrape()">🚀 開始爬取</button>
-            <button class="btn-test" onclick="startTest()" id="btn-test">🧪 測試（只上1個）</button>
+            <span style="display:inline-flex;align-items:center;gap:5px;">
+                <button class="btn-test" onclick="startTest()" id="btn-test">🧪 測試上架</button>
+                <input type="number" id="test-count" value="3" min="1" max="50" style="width:50px;padding:6px;border:1px solid #333;border-radius:4px;background:#1a1a1a;color:#fff;text-align:center;">
+                <span style="color:#999;font-size:13px;">個</span>
+            </span>
             <button class="btn-test" onclick="testPrice()">🧮 定價計算</button>
         </div>
     </div>
@@ -252,18 +272,19 @@ function log(msg, isError = false) {
 
 async function startTest() {
     const category = document.getElementById('category').value;
+    const testCount = parseInt(document.getElementById('test-count').value) || 3;
     document.getElementById('btn-start').disabled = true;
     document.getElementById('btn-test').disabled = true;
     document.getElementById('progress-section').style.display = 'block';
     document.getElementById('product-list').style.display = 'block';
     document.getElementById('product-items').innerHTML = '';
-    log(`🧪 測試模式: ${category} (只上架1個商品)`);
+    log(`🧪 測試模式: ${category} (上架 ${testCount} 個商品)`);
 
     try {
         const resp = await fetch('/api/start-scrape', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ category, max_pages: 1, mode: 'full', test_mode: true })
+            body: JSON.stringify({ category, max_pages: 1, mode: 'full', test_mode: true, test_count: testCount })
         });
         const data = await resp.json();
         if (data.error) {
@@ -407,6 +428,7 @@ def api_start_scrape():
     max_pages = data.get("max_pages", 0)
     mode = data.get("mode", "full")
     test_mode = data.get("test_mode", False)
+    test_count = data.get("test_count", 1)
 
     # 決定要爬的分類
     if category == "all":
@@ -434,13 +456,13 @@ def api_start_scrape():
     # 在背景線程中執行
     thread = threading.Thread(
         target=run_scrape_thread,
-        args=(cats, max_pages, mode, test_mode),
+        args=(cats, max_pages, mode, test_mode, test_count),
         daemon=True,
     )
     thread.start()
 
     cat_names = ", ".join(CATEGORIES[c]["name"] for c in cats)
-    test_label = " [🧪 測試模式：只上1個]" if test_mode else ""
+    test_label = f" [🧪 測試模式：上架 {test_count} 個]" if test_mode else ""
     pages_label = "全部" if max_pages == 0 else f"最多 {max_pages}"
     return jsonify({"message": f"開始爬取: {cat_names} ({pages_label} 頁){test_label}"})
 
@@ -471,12 +493,12 @@ def api_debug_screenshot():
 # ============================================================
 # 背景爬蟲執行
 # ============================================================
-def run_scrape_thread(categories: list, max_pages: int, mode: str, test_mode: bool = False):
+def run_scrape_thread(categories: list, max_pages: int, mode: str, test_mode: bool = False, test_count: int = 1):
     """在背景線程中執行爬蟲"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(run_scrape_async(categories, max_pages, mode, test_mode))
+        loop.run_until_complete(run_scrape_async(categories, max_pages, mode, test_mode, test_count))
     except Exception as e:
         logger.error(f"爬蟲執行錯誤: {e}")
         scrape_status["errors"].append(str(e))
@@ -486,7 +508,7 @@ def run_scrape_thread(categories: list, max_pages: int, mode: str, test_mode: bo
         loop.close()
 
 
-async def run_scrape_async(categories: list, max_pages: int, mode: str, test_mode: bool = False):
+async def run_scrape_async(categories: list, max_pages: int, mode: str, test_mode: bool = False, test_count: int = 1):
     """非同步爬蟲主流程"""
     global scrape_status
     scraper = AdidasScraper()
@@ -515,10 +537,10 @@ async def run_scrape_async(categories: list, max_pages: int, mode: str, test_mod
             all_products.extend(products)
             logger.info(f"{cat['name']} 找到 {len(products)} 個商品")
 
-        # 測試模式只處理第1個商品
-        if test_mode and len(all_products) > 0:
-            all_products = [all_products[0]]
-            logger.info("🧪 測試模式：只處理第 1 個商品")
+        # 測試模式限制商品數量
+        if test_mode and len(all_products) > test_count:
+            all_products = all_products[:test_count]
+            logger.info(f"🧪 測試模式：只處理前 {test_count} 個商品")
 
         scrape_status["total"] = len(all_products)
         logger.info(f"共找到 {len(all_products)} 個商品")
@@ -548,34 +570,51 @@ async def run_scrape_async(categories: list, max_pages: int, mode: str, test_mod
 
             # 爬取詳細頁（完整模式）
             detail = None
-            if mode == "full":
-                scrape_status["current_product"] = (
-                    f"[{idx+1}/{len(all_products)}] 爬取詳細頁: {product['sku']}"
-                )
-                detail = await scraper.scrape_product_detail(product["url"])
-                time.sleep(1)  # 避免太快被封
-
-            # 上架到 Shopify
-            if uploader:
-                collection_id = uploader.get_or_create_collection(
-                    product["collection_name"]
-                )
-                result = uploader.upload_product(product, detail, collection_id)
-                if result["success"]:
-                    product_entry["status"] = "success"
-                    product_entry["status_text"] = "已上架"
-                    scrape_status["uploaded"] += 1
-                else:
-                    product_entry["status"] = "error"
-                    product_entry["status_text"] = "失敗"
-                    scrape_status["failed"] += 1
-                    scrape_status["errors"].append(
-                        f"{product['sku']}: {result.get('error', '')[:100]}"
+            try:
+                if mode == "full":
+                    scrape_status["current_product"] = (
+                        f"[{idx+1}/{len(all_products)}] 爬取詳細頁: {product['sku']}"
                     )
-            else:
-                # 無 Shopify（測試模式）
-                product_entry["status"] = "skip"
-                product_entry["status_text"] = "測試模式"
+                    # 加上 120 秒超時，防止 Playwright crash 後無限卡住
+                    try:
+                        detail = await asyncio.wait_for(
+                            scraper.scrape_product_detail(product["url"]),
+                            timeout=120
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"  ⏰ 詳細頁超時(120s)，跳過: {product['sku']}")
+                        # 超時通常意味著瀏覽器卡死，重啟
+                        try:
+                            await scraper._restart_browser()
+                        except Exception:
+                            pass
+                        detail = None
+                    time.sleep(1)  # 避免太快被封
+
+                # 上架到 Shopify
+                if uploader:
+                    result = uploader.upload_product(product, detail, None)
+                    if result["success"]:
+                        product_entry["status"] = "success"
+                        product_entry["status_text"] = "已上架"
+                        scrape_status["uploaded"] += 1
+                    else:
+                        product_entry["status"] = "error"
+                        product_entry["status_text"] = "失敗"
+                        scrape_status["failed"] += 1
+                        scrape_status["errors"].append(
+                            f"{product['sku']}: {result.get('error', '')[:100]}"
+                        )
+                else:
+                    # 無 Shopify（測試模式）
+                    product_entry["status"] = "skip"
+                    product_entry["status_text"] = "測試模式"
+            except Exception as e:
+                logger.error(f"❌ 處理商品 {product['sku']} 異常: {e}")
+                product_entry["status"] = "error"
+                product_entry["status_text"] = f"異常: {str(e)[:50]}"
+                scrape_status["failed"] += 1
+                scrape_status["errors"].append(f"{product['sku']}: {str(e)[:100]}")
 
             scrape_status["products"].append(product_entry)
 

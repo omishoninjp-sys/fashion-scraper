@@ -311,6 +311,16 @@ def parse_product_page(url):
         if response.status_code != 200:
             return None
         soup = BeautifulSoup(response.text, 'html.parser')
+        # === 缺貨檢查：發現缺貨關鍵字直接跳過不上架 ===
+        page_text = soup.get_text()
+        for keyword in OUT_OF_STOCK_KEYWORDS:
+            if keyword in page_text:
+                print(f"[跳過] 缺貨（{keyword}）: {url}")
+                return None
+        if '売り切れ' in page_text or '品切れ' in page_text:
+            print(f"[跳過] 缺貨（売り切れ/品切れ）: {url}")
+            return None
+        # === 缺貨檢查結束 ===
         title = ''
         title_elem = soup.find('h1', class_='block-goods-name')
         if title_elem:

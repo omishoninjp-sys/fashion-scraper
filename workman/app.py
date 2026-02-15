@@ -321,7 +321,7 @@ def parse_product_page(url):
                 print(f"[跳過] 缺貨（{keyword}）: {url}")
                 return None
         if '売り切れ' in page_text or '品切れ' in page_text:
-            print(f"[跳過] 缺貨（売り切れ/品切れ/予約受付は終了）: {url}")
+            print(f"[跳過] 缺貨（売り切れ/品切れ）: {url}")
             return None
         # === 缺貨檢查結束 ===
         title = ''
@@ -724,7 +724,7 @@ def check_workman_stock(product_url):
             if keyword in page_text:
                 return {'available': False, 'page_exists': True, 'out_of_stock_reason': keyword}
         if '売り切れ' in page_text or '品切れ' in page_text:
-            return {'available': False, 'page_exists': True, 'out_of_stock_reason': '売り切れ / 品切れ / 予約受付は終了'}
+            return {'available': False, 'page_exists': True, 'out_of_stock_reason': '売り切れ / 品切れ'}
         return result
     except requests.exceptions.Timeout:
         return {'available': True, 'page_exists': True, 'out_of_stock_reason': '連線超時（暫不處理）'}
@@ -922,8 +922,6 @@ def update_existing_product_price(product_id, product_data):
     """已存在的商品：只更新價格，不重新翻譯"""
     cost = product_data['price']
     selling_price = calculate_selling_price(cost, DEFAULT_WEIGHT)
-    
-    # 取得商品的所有 variants
     query = f"""
     {{
       product(id: "{product_id}") {{
@@ -932,18 +930,6 @@ def update_existing_product_price(product_id, product_data):
             node {{
               id
               sku
-              inventoryItem {{
-                id
-                inventoryLevels(first: 5) {{
-                  edges {{
-                    node {{
-                      id
-                      location {{ id }}
-                      quantities(names: ["available"]) {{ name quantity }}
-                    }}
-                  }}
-                }}
-              }}
             }}
           }}
         }}
@@ -952,13 +938,10 @@ def update_existing_product_price(product_id, product_data):
     """
     result = graphql_request(query)
     variants = result.get('data', {}).get('product', {}).get('variants', {}).get('edges', [])
-    
     updated_variants = 0
     for v_edge in variants:
         v_node = v_edge['node']
         variant_id = v_node['id']
-        
-        # 更新價格
         mutation = """mutation productVariantUpdate($input: ProductVariantInput!) {
             productVariantUpdate(input: $input) {
                 productVariant { id }
@@ -968,7 +951,6 @@ def update_existing_product_price(product_id, product_data):
         graphql_request(mutation, {"input": {"id": variant_id, "price": str(selling_price)}})
         updated_variants += 1
         time.sleep(0.1)
-    
     return updated_variants
 
 
@@ -999,8 +981,8 @@ def run_full_sync(category='all'):
     1. 爬 workman.jp 取得所有商品連結
     2. 比對 Shopify 現有商品
     3. 新商品 → 翻譯 + 上架
-    4. 已存在 + 有貨 → 只更新價格，庫存設有貨
-    5. 已存在 + 缺貨（parse 回傳 None）→ 庫存歸零 + 設草稿
+    4. 已存在 + 有貨 → 只更新價格
+    5. 已存在 + 缺貨 → 庫存歸零 + 設草稿
     6. workman 沒有、Shopify 有 → 設草稿
     """
     global scrape_status
@@ -1009,14 +991,14 @@ def run_full_sync(category='all'):
         cats = ['work', 'mens', 'womens', 'kids'] if category == 'all' else [category] if category in CATEGORIES else []
         if not cats: raise Exception(f'未知分類: {category}')
         
-        # 1. 取得 Shopify 現有商品（含 inventory 資料）
+        # 1. 取得 Shopify 現有商品
         scrape_status['current_product'] = '取得 Shopify 現有商品...'
         existing_products = fetch_workman_products_with_source()
         existing_handles = {p['handle']: p for p in existing_products}
         print(f"[SYNC] Shopify 現有 {len(existing_handles)} 個 WORKMAN 商品")
         
         # 2. 爬取 + 比對
-        new_entries = []  # 新商品用 Bulk Upload
+        new_entries = []
         scraped_handles = set()
         updated_count = 0
         price_updated_count = 0
@@ -1034,7 +1016,6 @@ def run_full_sync(category='all'):
                 code = link.split('/')[-2] if link.endswith('/') else link.split('/')[-1]
                 scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {code}"
                 
-                # 從 URL 取得 manage_code
                 match = re.search(r'/g/g(\d+)/', link)
                 manage_code = match.group(1) if match else ''
                 my_handle = f"workman-{manage_code}" if manage_code else ''
@@ -1042,14 +1023,12 @@ def run_full_sync(category='all'):
                 existing_info = existing_handles.get(my_handle) if my_handle else None
                 
                 if existing_info:
-                    # ===== 已存在的商品：只檢查庫存 + 更新價格 =====
+                    # ===== 已存在：檢查庫存 + 更新價格 =====
                     scraped_handles.add(my_handle)
-                    
-                    # 檢查官網庫存（用簡單的 HTTP GET，不需要完整 parse）
                     stock = check_workman_stock(link)
                     
                     if stock['available']:
-                        # 有貨 → 只更新價格 + 確保 ACTIVE
+                        # 有貨 → 更新價格 + 確保 ACTIVE
                         try:
                             response = requests.get(link, headers=HEADERS, timeout=30)
                             if response.status_code == 200:
@@ -1061,14 +1040,11 @@ def run_full_sync(category='all'):
                                     price_match = re.search(r'[\d,]+', price_elem.get_text(strip=True))
                                     if price_match:
                                         new_price = int(price_match.group().replace(',', ''))
-                                        product_data_simple = {'price': new_price}
-                                        update_existing_product_price(existing_info['id'], product_data_simple)
+                                        update_existing_product_price(existing_info['id'], {'price': new_price})
                                         price_updated_count += 1
                             
-                            # 確保商品是 ACTIVE（可能之前被設為草稿）
                             if existing_info.get('status') == 'DRAFT':
                                 set_product_active(existing_info['id'])
-                                # 重新發布
                                 publications = get_all_publication_ids()
                                 if publications:
                                     pub_mutation = """mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) { publishablePublish(id: $id, input: $input) { userErrors { field message } } }"""
@@ -1090,7 +1066,7 @@ def run_full_sync(category='all'):
                     
                     time.sleep(0.3)
                 else:
-                    # ===== 新商品：完整爬取 + 翻譯 + 加入 Bulk Upload =====
+                    # ===== 新商品：完整爬取 + 翻譯 + Bulk Upload =====
                     product_data = parse_product_page(link)
                     if not product_data: continue
                     
@@ -1130,7 +1106,6 @@ def run_full_sync(category='all'):
             if user_errors: raise Exception(f'userErrors: {user_errors}')
             scrape_status['bulk_operation_id'] = bulk_op.get('id', '')
             
-            # 等待完成
             scrape_status['current_product'] = '等待上傳完成...'
             max_wait, wait_time = 600, 0
             while wait_time < max_wait:
@@ -1140,7 +1115,6 @@ def run_full_sync(category='all'):
                 time.sleep(5); wait_time += 5
             if wait_time >= max_wait: raise Exception('超時')
             
-            # 發布新商品
             scrape_status['phase'] = 'publishing'
             scrape_status['current_product'] = '發布新商品...'
             batch_publish_workman_products()
@@ -1152,7 +1126,6 @@ def run_full_sync(category='all'):
         for handle, product_info in existing_handles.items():
             if handle not in scraped_handles and product_info.get('status', '') == 'ACTIVE':
                 print(f"[SYNC] 🗑 下架: {handle} - {product_info.get('title', '')[:30]}")
-                # 庫存歸零
                 for variant in product_info.get('variants', []):
                     for level in variant.get('inventory_levels', []):
                         if level['available'] > 0:

@@ -5,7 +5,7 @@ BAPE 商品爬蟲 + Shopify Bulk Operations 上架工具
 1. 按分類爬取 jp.bape.com 商品（メンズ、レディース、キッズ）
 2. 翻譯並產生 JSONL 檔案
 3. 使用 Shopify Bulk Operations API 批量上傳
-4. 自動同步：相同商品覆蓋更新，下架商品設為草稿
+4. 智慧同步：新商品上架、已存在只更新價格、下架商品設為草稿
 """
 
 from flask import Flask, jsonify, request
@@ -181,6 +181,12 @@ def get_all_publication_ids():
     return [edge['node']['id'] for edge in result.get('data', {}).get('publications', {}).get('edges', [])]
 
 
+def get_all_publications():
+    query = """{ publications(first: 20) { edges { node { id name } } } }"""
+    result = graphql_request(query)
+    return [{'id': edge['node']['id'], 'name': edge['node']['name']} for edge in result.get('data', {}).get('publications', {}).get('edges', [])]
+
+
 def calculate_selling_price(cost, weight):
     """(成本 + 重量*1250) / 0.7，無條件捨去"""
     shipping_cost = weight * 1250
@@ -247,8 +253,6 @@ def translate_with_chatgpt(title, description, size_spec=''):
             },
             timeout=60
         )
-        
-        print(f"[翻譯] API 回應狀態: {response.status_code}", flush=True)
         
         if response.status_code == 200:
             content = response.json()['choices'][0]['message']['content'].strip()
@@ -345,63 +349,42 @@ def clean_description(description):
 # ========== 爬取函數 ==========
 
 def fetch_products_json(page=1):
-    """從 BAPE 網站取得所有商品（JSON API）"""
     url = f"{SOURCE_URL}/collections/all/products.json?page={page}&limit=50"
-    
     print(f"[爬取] 第 {page} 頁: {url}", flush=True)
-    
     try:
         response = requests.get(url, headers=HEADERS, timeout=30)
-        print(f"[爬取] HTTP 狀態: {response.status_code}", flush=True)
-        
         if response.status_code != 200:
             return []
-        
         data = response.json()
         products = data.get('products', [])
         print(f"[爬取] 第 {page} 頁取得 {len(products)} 個商品", flush=True)
         return products
-        
     except Exception as e:
         print(f"[錯誤] {e}", flush=True)
-        import traceback
-        traceback.print_exc()
         return []
 
 
 def get_product_category(product):
-    """根據商品資訊判斷分類"""
     tags = product.get('tags', [])
     title = product.get('title', '').upper()
-    
-    # 優先檢查 tags
     tags_str = ','.join(tags).lower() if isinstance(tags, list) else str(tags).lower()
     
-    # 童裝判斷（優先，因為童裝商品名稱可能不含 KIDS）
     if 'キッズ' in tags_str or 'kids' in tags_str or 'KIDS' in title or 'キッズ' in title:
         return 'kids'
-    
-    # 女裝判斷
     if 'レディース' in tags_str or 'ladies' in tags_str or 'women' in tags_str or 'LADIES' in title or 'レディース' in title:
         return 'womens'
-    
-    # 男裝判斷（預設）
     if 'メンズ' in tags_str or 'mens' in tags_str or 'men' in tags_str or 'メンズ' in title:
         return 'mens'
-    
-    # 無法判斷時預設為男裝
     return 'mens'
 
 
 def fetch_all_products_by_category():
-    """取得所有商品並按分類整理"""
     all_products = {'mens': [], 'womens': [], 'kids': []}
     page = 1
     seen_handles = set()
     
     while True:
         products = fetch_products_json(page)
-        
         if not products:
             break
         
@@ -412,12 +395,10 @@ def fetch_all_products_by_category():
                 continue
             seen_handles.add(handle)
             
-            # 檢查庫存
             has_stock = any(v.get('available', False) for v in p.get('variants', []))
             if not has_stock:
                 continue
             
-            # 判斷分類
             category = get_product_category(p)
             all_products[category].append(p)
             new_count += 1
@@ -434,101 +415,25 @@ def fetch_all_products_by_category():
     return all_products
 
 
-def fetch_category_products_html(category_key, page=1):
-    """從 BAPE 網站 HTML 頁面取得商品列表（備用方法）"""
-    cat_info = CATEGORIES[category_key]
-    
-    if page == 1:
-        url = f"{SOURCE_URL}{cat_info['base_url']}?{cat_info['filter']}"
-    else:
-        url = f"{SOURCE_URL}{cat_info['base_url']}?{cat_info['filter']}&page={page}"
-    
-    print(f"[爬取 HTML] {cat_info['name']} 第 {page} 頁: {url}")
-    
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        print(f"[爬取 HTML] HTTP 狀態: {response.status_code}")
-        
-        if response.status_code != 200:
-            return [], False
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        product_handles = []
-        all_links = soup.find_all('a', href=True)
-        
-        for link in all_links:
-            href = link.get('href', '')
-            if '/products/' in href:
-                match = re.search(r'/products/([^/?#]+)', href)
-                if match:
-                    handle = match.group(1)
-                    if handle not in product_handles and handle != 'products':
-                        product_handles.append(handle)
-        
-        print(f"[爬取 HTML] 找到 {len(product_handles)} 個商品")
-        
-        has_next_page = False
-        for link in all_links:
-            if f'page={page + 1}' in link.get('href', ''):
-                has_next_page = True
-                break
-        
-        return product_handles, has_next_page
-        
-    except Exception as e:
-        print(f"[錯誤] {e}")
-        return [], False
-
-
-def fetch_product_json(handle):
-    """取得單一商品的 JSON 資料"""
-    url = f"{SOURCE_URL}/products/{handle}.json"
-    
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get('product')
-    except Exception as e:
-        print(f"[錯誤] 取得商品 {handle} 失敗: {e}")
-    
-    return None
-
-
-def fetch_all_category_products(category_key):
-    """取得分類內所有商品（使用 JSON API + 程式過濾）"""
-    all_by_category = fetch_all_products_by_category()
-    products = all_by_category.get(category_key, [])
-    print(f"[爬取] {CATEGORIES[category_key]['name']} 共 {len(products)} 個有庫存商品")
-    return products
-
-
 def fetch_size_table(handle):
     try:
         url = f"{SOURCE_URL}/products/{handle}"
         response = requests.get(url, headers={'User-Agent': HEADERS['User-Agent'], 'Accept': 'text/html'}, timeout=30)
-        
         if response.status_code != 200:
             return None
-        
         soup = BeautifulSoup(response.text, 'html.parser')
         def_list = soup.find('dl', class_='s-product-detail__def-list-description')
         if not def_list:
             return None
-        
         size_dt = def_list.find('dt', string=re.compile(r'サイズ'))
         if not size_dt:
             return None
-        
         size_dd = size_dt.find_next_sibling('dd')
         if not size_dd:
             return None
-        
         table = size_dd.find('table')
         if not table:
             return None
-        
         rows = table.find_all('tr')
         return '\n'.join([' | '.join([cell.get_text(strip=True) for cell in row.find_all(['th', 'td'])]) for row in rows])
     except:
@@ -538,7 +443,6 @@ def fetch_size_table(handle):
 # ========== JSONL 生成 ==========
 
 def product_to_jsonl_entry(product, category_key, collection_id, existing_product_id=None):
-    """將商品資料轉換為 JSONL 格式，支援更新現有商品"""
     cat_info = CATEGORIES[category_key]
     
     title = product.get('title', '')
@@ -568,7 +472,6 @@ def product_to_jsonl_entry(product, category_key, collection_id, existing_produc
     image_list = [img['src'] for img in images[:10]] if images else []
     first_image = image_list[0] if image_list else None
     
-    # 建立 image_id -> image_url 對應
     image_id_to_url = {}
     for img in images:
         img_id = img.get('id')
@@ -613,13 +516,10 @@ def product_to_jsonl_entry(product, category_key, collection_id, existing_produc
         if option_values:
             variant["optionValues"] = option_values
         
-        # 找到這個 variant 對應的圖片
         variant_image_id = sv.get('image_id') or sv.get('featured_image', {}).get('id')
         if variant_image_id and variant_image_id in image_id_to_url:
-            variant_image_url = image_id_to_url[variant_image_id]
-            variant["file"] = {"originalSource": variant_image_url, "contentType": "IMAGE"}
+            variant["file"] = {"originalSource": image_id_to_url[variant_image_id], "contentType": "IMAGE"}
         elif first_image:
-            # 如果沒有對應圖片，用第一張
             variant["file"] = {"originalSource": first_image, "contentType": "IMAGE"}
         
         variants.append(variant)
@@ -642,7 +542,6 @@ def product_to_jsonl_entry(product, category_key, collection_id, existing_produc
         "metafields": [{"namespace": "custom", "key": "link", "value": source_url, "type": "url"}]
     }
     
-    # 如果商品已存在，加入 id 來更新
     if existing_product_id:
         product_input["id"] = existing_product_id
     
@@ -715,29 +614,6 @@ def check_bulk_operation_status(operation_id=None):
 
 # ========== 商品管理 ==========
 
-def get_all_publications():
-    query = """{ publications(first: 20) { edges { node { id name } } } }"""
-    result = graphql_request(query)
-    return [{'id': edge['node']['id'], 'name': edge['node']['name']} for edge in result.get('data', {}).get('publications', {}).get('edges', [])]
-
-
-def get_product_id_by_handle(handle):
-    """根據 handle 查詢商品 ID"""
-    query = """
-    query getProductByHandle($handle: String!) {
-      productByHandle(handle: $handle) {
-        id
-        title
-      }
-    }
-    """
-    result = graphql_request(query, {"handle": handle})
-    product = result.get('data', {}).get('productByHandle')
-    if product:
-        return product['id']
-    return None
-
-
 def fetch_bape_product_ids():
     all_products = []
     cursor = None
@@ -755,7 +631,7 @@ def fetch_bape_product_ids():
         
         for edge in edges:
             node = edge['node']
-            all_products.append({'id': node['id'], 'title': node['title'], 'handle': node['handle'], 'status': node['status']})
+            all_products.append({'id': node['id'], 'title': node['title'], 'handle': node['handle'], 'status': node.get('status', '')})
             cursor = edge['cursor']
         
         if not products.get('pageInfo', {}).get('hasNextPage', False):
@@ -771,8 +647,55 @@ def set_product_to_draft(product_id):
     return not result.get('data', {}).get('productUpdate', {}).get('userErrors', [])
 
 
+def set_product_active(product_id):
+    mutation = """mutation productUpdate($input: ProductInput!) { productUpdate(input: $input) { product { id status } userErrors { field message } } }"""
+    result = graphql_request(mutation, {"input": {"id": product_id, "status": "ACTIVE"}})
+    return not result.get('data', {}).get('productUpdate', {}).get('userErrors', [])
+
+
+def update_existing_product_price(product_id, source_variants):
+    """已存在的商品：只更新所有 variant 的價格"""
+    # 取得 Shopify 上的 variants
+    query = f"""{{ product(id: "{product_id}") {{ variants(first: 100) {{ edges {{ node {{ id sku }} }} }} }} }}"""
+    result = graphql_request(query)
+    shopify_variants = result.get('data', {}).get('product', {}).get('variants', {}).get('edges', [])
+    
+    if not shopify_variants:
+        return 0
+    
+    # 從來源 variants 計算最新售價（取最低價作為代表）
+    costs = []
+    for sv in source_variants:
+        if sv.get('available', False):
+            cost = float(sv.get('price', 0))
+            if cost >= MIN_PRICE:
+                costs.append(cost)
+    
+    if not costs:
+        return 0
+    
+    # 用最低成本計算售價
+    min_cost = min(costs)
+    weight = float(source_variants[0].get('grams', 0)) / 1000 if source_variants[0].get('grams') else DEFAULT_WEIGHT
+    selling_price = calculate_selling_price(min_cost, weight)
+    
+    updated = 0
+    for v_edge in shopify_variants:
+        variant_id = v_edge['node']['id']
+        mutation = """mutation productVariantUpdate($input: ProductVariantInput!) {
+            productVariantUpdate(input: $input) {
+                productVariant { id }
+                userErrors { field message }
+            }
+        }"""
+        graphql_request(mutation, {"input": {"id": variant_id, "price": str(selling_price)}})
+        updated += 1
+        time.sleep(0.1)
+    
+    return updated
+
+
 def delete_product(product_id):
-    """刪除單一商品"""
     mutation = """
     mutation productDelete($input: ProductDeleteInput!) {
       productDelete(input: $input) {
@@ -782,38 +705,26 @@ def delete_product(product_id):
     }
     """
     result = graphql_request(mutation, {"input": {"id": product_id}})
-    user_errors = result.get('data', {}).get('productDelete', {}).get('userErrors', [])
-    return not user_errors
+    return not result.get('data', {}).get('productDelete', {}).get('userErrors', [])
 
 
 def delete_all_bape_products():
-    """刪除所有 BAPE 商品"""
     global scrape_status
-    
     print("[DELETE] 開始刪除所有 BAPE 商品...")
-    
     products = fetch_bape_product_ids()
     total = len(products)
-    
     if total == 0:
         return {'success': True, 'deleted': 0, 'message': '沒有 BAPE 商品'}
     
-    print(f"[DELETE] 找到 {total} 個 BAPE 商品")
-    
     deleted = 0
     failed = 0
-    
     for i, product in enumerate(products):
         scrape_status['current_product'] = f"刪除中 [{i+1}/{total}] {product.get('title', '')[:30]}"
         scrape_status['progress'] = i + 1
-        
         if delete_product(product['id']):
             deleted += 1
-            print(f"[DELETE] 已刪除: {product.get('title', '')[:30]}")
         else:
             failed += 1
-            print(f"[DELETE] 刪除失敗: {product.get('title', '')[:30]}")
-        
         time.sleep(0.2)
     
     return {'success': True, 'deleted': deleted, 'failed': failed, 'total': total}
@@ -822,44 +733,31 @@ def delete_all_bape_products():
 def batch_publish_bape_products():
     products = fetch_bape_product_ids()
     if not products:
-        return {'success': False, 'error': 'No products'}
+        return {'success': 0, 'failed': 0}
     
     publications = get_all_publications()
     if not publications:
-        return {'success': False, 'error': 'No publications'}
+        return {'success': 0, 'failed': 0}
     
     publication_inputs = [{"publicationId": pub['id']} for pub in publications]
-    results = {'total': len(products), 'success': 0, 'failed': 0, 'errors': []}
+    results = {'total': len(products), 'success': 0, 'failed': 0}
     
-    # 發布 mutation
     pub_mutation = """mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) { publishablePublish(id: $id, input: $input) { userErrors { field message } } }"""
-    
-    # 設定 Category mutation
-    category_mutation = """mutation productUpdate($input: ProductInput!) {
-        productUpdate(input: $input) {
-            product { id }
-            userErrors { field message }
-        }
-    }"""
+    category_mutation = """mutation productUpdate($input: ProductInput!) { productUpdate(input: $input) { product { id } userErrors { field message } } }"""
     
     for product in products:
-        # 發布到銷售渠道
         result = graphql_request(pub_mutation, {"id": product['id'], "input": publication_inputs})
         if result.get('data', {}).get('publishablePublish', {}).get('userErrors', []):
             results['failed'] += 1
         else:
             results['success'] += 1
         
-        # 設定 Category 為 Apparel & Accessories
-        cat_result = graphql_request(category_mutation, {
+        graphql_request(category_mutation, {
             "input": {
                 "id": product['id'],
-                "productCategory": {
-                    "productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/1"
-                }
+                "productCategory": {"productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/1"}
             }
         })
-        
         time.sleep(0.1)
     
     return results
@@ -874,31 +772,18 @@ def run_test_single(category='mens'):
     
     try:
         cat_info = CATEGORIES[category]
-        print(f"[TEST] 分類: {category}, Collection: {cat_info['collection']}")
-        
-        scrape_status['current_product'] = f"取得 Collection..."
         collection_id = get_or_create_collection(cat_info['collection'])
-        print(f"[TEST] Collection ID: {collection_id}")
-        
         if not collection_id:
             scrape_status['errors'].append({'error': '無法建立 Collection'})
-            scrape_status['current_product'] = '❌ 無法建立 Collection'
             return
         
-        scrape_status['current_product'] = f"爬取商品..."
-        
-        # 取得所有商品並分類
         all_by_category = fetch_all_products_by_category()
         products = all_by_category.get(category, [])
         
-        print(f"[TEST] {category} 有 {len(products)} 個商品")
-        
         if not products:
             scrape_status['errors'].append({'error': f'沒有找到 {cat_info["name"]} 的商品'})
-            scrape_status['current_product'] = f'❌ 沒有找到 {cat_info["name"]} 的商品'
             return
         
-        # 取第一個符合條件的商品
         test_product = None
         for p in products:
             min_price = min((float(v.get('price', 0)) for v in p.get('variants', [])), default=0)
@@ -907,56 +792,22 @@ def run_test_single(category='mens'):
                 break
         
         if not test_product:
-            scrape_status['errors'].append({'error': f'沒有符合條件的商品（價格 >= {MIN_PRICE}）'})
-            scrape_status['current_product'] = '❌ 沒有符合條件的商品'
+            scrape_status['errors'].append({'error': '沒有符合條件的商品'})
             return
         
-        print(f"[TEST] 測試商品: {test_product.get('title', '')[:50]}")
-        
-        # 檢查商品是否已存在
-        my_handle = f"bape-{test_product.get('handle', '')}"
-        existing_id = get_product_id_by_handle(my_handle)
-        if existing_id:
-            print(f"[TEST] 商品已存在，將進行更新: {existing_id}")
-        else:
-            print(f"[TEST] 商品不存在，將建立新商品")
-        
         scrape_status['current_product'] = f"翻譯: {test_product['title'][:30]}..."
-        entry = product_to_jsonl_entry(test_product, category, collection_id, existing_id)
+        entry = product_to_jsonl_entry(test_product, category, collection_id)
         
         if not entry:
-            scrape_status['errors'].append({'error': '商品轉換失敗（可能沒有有效的 variant）'})
-            scrape_status['current_product'] = '❌ 商品轉換失敗'
+            scrape_status['errors'].append({'error': '商品轉換失敗'})
             return
         
         product_input = entry['productSet']
-        print(f"[TEST] 轉換成功: {product_input['title']}")
-        print(f"[TEST] Variants: {len(product_input.get('variants', []))}")
-        
         scrape_status['products'].append({'title': product_input['title'], 'handle': product_input['handle'], 'variants': len(product_input.get('variants', []))})
         
         scrape_status['current_product'] = "上傳到 Shopify..."
         mutation = """mutation productSet($input: ProductSetInput!, $synchronous: Boolean!) { productSet(synchronous: $synchronous, input: $input) { product { id title handle } userErrors { field code message } } }"""
-        
-        # 除錯：打印完整的 product_input
-        print(f"[TEST] ===== ProductSet Input =====")
-        print(f"[TEST] title: {product_input.get('title')}")
-        print(f"[TEST] handle: {product_input.get('handle')}")
-        print(f"[TEST] vendor: {product_input.get('vendor')}")
-        print(f"[TEST] productType: {product_input.get('productType')}")
-        print(f"[TEST] productOptions: {product_input.get('productOptions')}")
-        print(f"[TEST] variants count: {len(product_input.get('variants', []))}")
-        if product_input.get('variants'):
-            print(f"[TEST] first variant: {product_input['variants'][0]}")
-        print(f"[TEST] collections: {product_input.get('collections')}")
-        print(f"[TEST] ================================")
-        
         result = graphql_request(mutation, {"input": product_input, "synchronous": True})
-        
-        # 除錯：打印完整回應
-        print(f"[TEST] ===== GraphQL Response =====")
-        print(f"[TEST] {json.dumps(result, ensure_ascii=False, indent=2)[:2000]}")
-        print(f"[TEST] ================================")
         
         product_set = result.get('data', {}).get('productSet', {})
         user_errors = product_set.get('userErrors', [])
@@ -965,7 +816,6 @@ def run_test_single(category='mens'):
             error_msg = '; '.join([e.get('message', str(e)) for e in user_errors])
             scrape_status['errors'].append({'error': error_msg})
             scrape_status['current_product'] = f"❌ 失敗: {error_msg}"
-            print(f"[ERROR] productSet 失敗: {error_msg}")
         else:
             product = product_set.get('product', {})
             publications = get_all_publications()
@@ -978,170 +828,54 @@ def run_test_single(category='mens'):
         
     except Exception as e:
         scrape_status['errors'].append({'error': str(e)})
-        import traceback
-        traceback.print_exc()
     finally:
         scrape_status['running'] = False
 
 
-def run_scrape(category):
+def run_full_sync(category='all'):
+    """
+    智慧同步：
+    1. 從 jp.bape.com JSON API 取得所有有庫存商品
+    2. 比對 Shopify 現有商品
+    3. 新商品 → 翻譯 + Bulk Upload
+    4. 已存在 + 有貨 → 只更新價格（不翻譯）
+    5. Shopify 有但 BAPE 沒有 → 設草稿
+    """
     global scrape_status
     
-    scrape_status = {"running": True, "phase": "scraping", "progress": 0, "total": 0, "current_product": "", "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "set_to_draft": 0}
+    print(f"[SYNC] ========== 開始智慧同步 ==========")
+    
+    scrape_status = {"running": True, "phase": "cron_sync", "progress": 0, "total": 0, "current_product": "開始智慧同步...", "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "set_to_draft": 0}
     
     try:
-        categories_to_scrape = ['mens', 'womens', 'kids'] if category == 'all' else [category] if category in CATEGORIES else []
-        if not categories_to_scrape:
-            scrape_status['errors'].append({'error': f'未知分類: {category}'})
-            return
-        
-        # 先取得所有現有商品的 handle -> id 映射
-        scrape_status['current_product'] = '取得現有商品...'
-        existing_products = fetch_bape_product_ids()
-        existing_handles = {p['handle']: p['id'] for p in existing_products}
-        print(f"[SCRAPE] 現有 {len(existing_handles)} 個 BAPE 商品")
-        
-        all_jsonl_entries = []
-        
-        for cat_key in categories_to_scrape:
-            cat_info = CATEGORIES[cat_key]
-            collection_id = get_or_create_collection(cat_info['collection'])
-            if not collection_id:
-                continue
-            
-            products = fetch_all_category_products(cat_key)
-            if not products:
-                continue
-            
-            scrape_status['total'] += len(products)
-            
-            for product in products:
-                scrape_status['progress'] += 1
-                scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {product.get('title', '')[:30]}"
-                
-                try:
-                    my_handle = f"bape-{product.get('handle', '')}"
-                    existing_id = existing_handles.get(my_handle)
-                    
-                    entry = product_to_jsonl_entry(product, cat_key, collection_id, existing_id)
-                    if entry:
-                        all_jsonl_entries.append(entry)
-                        scrape_status['products'].append({'title': entry['productSet']['title'], 'handle': entry['productSet']['handle'], 'variants': len(entry['productSet'].get('variants', []))})
-                except Exception as e:
-                    scrape_status['errors'].append({'error': str(e)})
-                
-                time.sleep(0.5)
-        
-        if all_jsonl_entries:
-            jsonl_path = os.path.join(JSONL_DIR, f"bape_{category}_{int(time.time())}.jsonl")
-            with open(jsonl_path, 'w', encoding='utf-8') as f:
-                for entry in all_jsonl_entries:
-                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-            scrape_status['jsonl_file'] = jsonl_path
-        
-        scrape_status['current_product'] = f"完成！共 {len(all_jsonl_entries)} 個商品"
-        
-    except Exception as e:
-        scrape_status['errors'].append({'error': str(e)})
-    finally:
-        scrape_status['running'] = False
-        scrape_status['phase'] = "completed"
-
-
-def run_bulk_upload(jsonl_path):
-    global scrape_status
-    
-    scrape_status['phase'] = 'uploading'
-    scrape_status['running'] = True
-    
-    try:
-        staged = create_staged_upload()
-        if not staged or not upload_jsonl_to_staged(staged, jsonl_path):
-            scrape_status['errors'].append({'error': '上傳失敗'})
-            return
-        
-        staged_path = next((p['value'] for p in staged['parameters'] if p['name'] == 'key'), staged.get('resourceUrl', ''))
-        result = run_bulk_mutation(staged_path)
-        
-        bulk_op = result.get('data', {}).get('bulkOperationRunMutation', {}).get('bulkOperation', {})
-        scrape_status['bulk_operation_id'] = bulk_op.get('id', '')
-        scrape_status['bulk_status'] = bulk_op.get('status', '')
-        scrape_status['current_product'] = f"批量操作已啟動: {bulk_op.get('status', '')}"
-        
-    except Exception as e:
-        scrape_status['errors'].append({'error': str(e)})
-    finally:
-        scrape_status['running'] = False
-
-
-def run_test_sync(category='all', limit=10):
-    """測試上架（每個分類只抓 limit 個商品）"""
-    global scrape_status
-    
-    print(f"[TEST SYNC] ========== 測試上架 (每分類 {limit} 個) ==========", flush=True)
-    
-    scrape_status = {"running": True, "phase": "test_sync", "progress": 0, "total": 0, "current_product": "開始測試上架...", "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "set_to_draft": 0}
-    
-    try:
-        # 取得現有商品
-        scrape_status['current_product'] = '取得現有商品...'
-        existing_products = fetch_bape_product_ids()
-        existing_handles = {p['handle']: p for p in existing_products}
-        print(f"[TEST SYNC] 現有 {len(existing_handles)} 個商品", flush=True)
-        
-        # 只爬取前幾頁（測試用，不需要全部）
-        scrape_status['current_product'] = '爬取商品（測試模式）...'
-        print(f"[TEST SYNC] 爬取商品（測試模式，只爬前 3 頁）...", flush=True)
-        
-        all_products_by_cat = {'mens': [], 'womens': [], 'kids': []}
-        
-        # 只爬取前 3 頁，足夠取得每分類 10 個商品
-        for page in range(1, 4):
-            products = fetch_products_json(page)
-            if not products:
-                break
-            
-            for p in products:
-                has_stock = any(v.get('available', False) for v in p.get('variants', []))
-                if not has_stock:
-                    continue
-                
-                cat = get_product_category(p)
-                if len(all_products_by_cat[cat]) < limit:
-                    all_products_by_cat[cat].append(p)
-            
-            # 檢查是否已經收集夠了
-            all_full = all(len(v) >= limit for v in all_products_by_cat.values())
-            if all_full:
-                break
-            
-            time.sleep(0.3)
-        
-        print(f"[TEST SYNC] 收集結果: 男裝 {len(all_products_by_cat['mens'])}, 女裝 {len(all_products_by_cat['womens'])}, 童裝 {len(all_products_by_cat['kids'])}", flush=True)
-        
         categories_to_scrape = ['mens', 'womens', 'kids'] if category == 'all' else [category] if category in CATEGORIES else []
         if not categories_to_scrape:
             raise Exception(f'未知分類: {category}')
         
-        all_jsonl_entries = []
+        # 1. 取得 Shopify 現有商品
+        scrape_status['current_product'] = '取得 Shopify 現有商品...'
+        existing_products = fetch_bape_product_ids()
+        existing_handles = {p['handle']: p for p in existing_products}
+        print(f"[SYNC] Shopify 現有 {len(existing_handles)} 個 BAPE 商品")
+        
+        # 2. 爬取 BAPE 所有商品（JSON API，自帶庫存和價格）
+        scrape_status['current_product'] = '爬取 BAPE 商品...'
+        all_by_category = fetch_all_products_by_category()
+        
+        # 3. 比對 + 處理
+        new_entries = []
+        scraped_handles = set()
+        updated_count = 0
+        price_updated_count = 0
         
         for cat_key in categories_to_scrape:
             cat_info = CATEGORIES[cat_key]
-            scrape_status['current_product'] = f"處理 {cat_info['collection']}..."
-            print(f"[TEST SYNC] 處理 {cat_info['collection']}...", flush=True)
-            
             collection_id = get_or_create_collection(cat_info['collection'])
             if not collection_id:
-                scrape_status['errors'].append({'error': f"無法取得 Collection: {cat_info['collection']}"})
                 continue
             
-            products = all_products_by_cat.get(cat_key, [])[:limit]
-            print(f"[TEST SYNC] {cat_info['collection']} 取 {len(products)} 個商品", flush=True)
-            
-            if not products:
-                scrape_status['errors'].append({'error': f"{cat_info['collection']} 沒有找到商品"})
-                continue
-            
+            products = all_by_category.get(cat_key, [])
+            print(f"[SYNC] {cat_info['collection']} 共 {len(products)} 個有庫存商品")
             scrape_status['total'] += len(products)
             
             for product in products:
@@ -1151,245 +885,110 @@ def run_test_sync(category='all', limit=10):
                 scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {title}"
                 
                 my_handle = f"bape-{handle}"
-                existing_info = existing_handles.get(my_handle)
-                existing_id = existing_info['id'] if existing_info else None
-                
-                try:
-                    print(f"[TEST SYNC] 開始轉換: {title}", flush=True)
-                    entry = product_to_jsonl_entry(product, cat_key, collection_id, existing_id)
-                    if entry:
-                        all_jsonl_entries.append(entry)
-                        scrape_status['products'].append({
-                            'title': entry['productSet']['title'],
-                            'handle': entry['productSet']['handle'],
-                            'variants': len(entry['productSet'].get('variants', []))
-                        })
-                        print(f"[TEST SYNC] 已加入: {entry['productSet']['title'][:30]}", flush=True)
-                    else:
-                        print(f"[TEST SYNC] 轉換返回 None: {title}", flush=True)
-                except Exception as e:
-                    print(f"[TEST SYNC] 轉換失敗: {title} - {e}", flush=True)
-                    import traceback
-                    traceback.print_exc()
-                    scrape_status['errors'].append({'error': f"轉換失敗: {str(e)}"})
-                
-                time.sleep(0.3)
-        
-        print(f"[TEST SYNC] 總共 {len(all_jsonl_entries)} 個商品準備上傳", flush=True)
-        
-        if not all_jsonl_entries:
-            raise Exception('沒有爬取到商品')
-        
-        # 寫入 JSONL
-        jsonl_path = os.path.join(JSONL_DIR, f"bape_test_{category}_{int(time.time())}.jsonl")
-        print(f"[TEST SYNC] 寫入 JSONL: {jsonl_path}", flush=True)
-        with open(jsonl_path, 'w', encoding='utf-8') as f:
-            for entry in all_jsonl_entries:
-                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-        scrape_status['jsonl_file'] = jsonl_path
-        
-        # 批量上傳
-        print(f"[TEST SYNC] 開始批量上傳 {len(all_jsonl_entries)} 個商品...", flush=True)
-        scrape_status['current_product'] = '批量上傳...'
-        scrape_status['phase'] = 'uploading'
-        
-        print(f"[TEST SYNC] 建立 Staged Upload...", flush=True)
-        staged = create_staged_upload()
-        if not staged:
-            raise Exception('建立 Staged Upload 失敗')
-        print(f"[TEST SYNC] Staged Upload 成功", flush=True)
-        
-        print(f"[TEST SYNC] 上傳 JSONL 檔案...", flush=True)
-        if not upload_jsonl_to_staged(staged, jsonl_path):
-            raise Exception('上傳 JSONL 失敗')
-        print(f"[TEST SYNC] 上傳 JSONL 成功", flush=True)
-        
-        staged_path = next((p['value'] for p in staged['parameters'] if p['name'] == 'key'), '')
-        print(f"[TEST SYNC] 執行 Bulk Mutation...", flush=True)
-        result = run_bulk_mutation(staged_path)
-        print(f"[TEST SYNC] Bulk Mutation 回應: {json.dumps(result, ensure_ascii=False)[:500]}", flush=True)
-        
-        bulk_op = result.get('data', {}).get('bulkOperationRunMutation', {}).get('bulkOperation', {})
-        user_errors = result.get('data', {}).get('bulkOperationRunMutation', {}).get('userErrors', [])
-        if user_errors:
-            print(f"[TEST SYNC] Bulk Mutation 錯誤: {user_errors}", flush=True)
-            raise Exception(f'Bulk Mutation 錯誤: {user_errors}')
-        
-        scrape_status['bulk_operation_id'] = bulk_op.get('id', '')
-        print(f"[TEST SYNC] Bulk Operation ID: {bulk_op.get('id', '')}", flush=True)
-        
-        # 等待完成
-        print(f"[TEST SYNC] 等待 Bulk Operation 完成...", flush=True)
-        scrape_status['current_product'] = '等待完成...'
-        for i in range(60):
-            status = check_bulk_operation_status()
-            current_status = status.get('status', '')
-            scrape_status['bulk_status'] = current_status
-            print(f"[TEST SYNC] Bulk Operation 狀態 ({i+1}/60): {current_status}", flush=True)
-            
-            if current_status == 'COMPLETED':
-                print(f"[TEST SYNC] Bulk Operation 完成！", flush=True)
-                break
-            elif current_status in ['FAILED', 'CANCELED']:
-                error_code = status.get('errorCode', '')
-                print(f"[TEST SYNC] Bulk Operation 失敗: {current_status}, {error_code}", flush=True)
-                raise Exception(f'Bulk 失敗: {current_status} - {error_code}')
-            time.sleep(5)
-        
-        # 發布
-        print(f"[TEST SYNC] 開始發布商品...", flush=True)
-        scrape_status['current_product'] = '發布...'
-        scrape_status['phase'] = 'publishing'
-        batch_publish_bape_products()
-        print(f"[TEST SYNC] 發布完成", flush=True)
-        
-        scrape_status['current_product'] = f"✅ 測試完成！上傳 {len(all_jsonl_entries)} 個商品"
-        scrape_status['phase'] = 'completed'
-        print(f"[TEST SYNC] ✅ 測試完成！上傳 {len(all_jsonl_entries)} 個商品", flush=True)
-        
-        return {'success': True, 'total_products': len(all_jsonl_entries)}
-        
-    except Exception as e:
-        print(f"[TEST SYNC] ❌ 錯誤: {str(e)}", flush=True)
-        scrape_status['errors'].append({'error': str(e)})
-        scrape_status['current_product'] = f"❌ 錯誤: {str(e)}"
-        scrape_status['phase'] = 'error'
-        import traceback
-        traceback.print_exc()
-        return {'success': False, 'error': str(e)}
-    finally:
-        scrape_status['running'] = False
-
-
-def run_full_sync(category='all'):
-    global scrape_status
-    
-    print(f"[CRON] ========== 開始同步 ==========")
-    
-    scrape_status = {"running": True, "phase": "cron_sync", "progress": 0, "total": 0, "current_product": "開始...", "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "set_to_draft": 0}
-    
-    try:
-        # 取得 Shopify 現有商品（包含 id）
-        scrape_status['current_product'] = '取得 Shopify 現有商品...'
-        existing_products = fetch_bape_product_ids()
-        existing_handles = {p['handle']: p for p in existing_products}
-        print(f"[CRON] Shopify 現有 {len(existing_handles)} 個商品")
-        
-        # 取得所有商品並分類
-        scrape_status['current_product'] = '爬取商品...'
-        all_by_category = fetch_all_products_by_category()
-        
-        categories_to_scrape = ['mens', 'womens', 'kids'] if category == 'all' else [category] if category in CATEGORIES else []
-        if not categories_to_scrape:
-            raise Exception(f'未知分類: {category}')
-        
-        all_jsonl_entries = []
-        scraped_handles = set()
-        
-        for cat_key in categories_to_scrape:
-            cat_info = CATEGORIES[cat_key]
-            scrape_status['current_product'] = f"處理 {cat_info['collection']}..."
-            
-            collection_id = get_or_create_collection(cat_info['collection'])
-            if not collection_id:
-                continue
-            
-            products = all_by_category.get(cat_key, [])
-            print(f"[CRON] {cat_info['collection']} 共 {len(products)} 個商品")
-            
-            scrape_status['total'] += len(products)
-            
-            for product in products:
-                scrape_status['progress'] += 1
-                handle = product.get('handle', '')
-                scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {product.get('title', '')[:30]}"
-                
-                my_handle = f"bape-{handle}"
                 scraped_handles.add(my_handle)
                 
                 existing_info = existing_handles.get(my_handle)
-                existing_id = existing_info['id'] if existing_info else None
                 
-                try:
-                    entry = product_to_jsonl_entry(product, cat_key, collection_id, existing_id)
-                    if entry:
-                        all_jsonl_entries.append(entry)
-                        scrape_status['products'].append({
-                            'title': entry['productSet']['title'],
-                            'handle': entry['productSet']['handle'],
-                            'variants': len(entry['productSet'].get('variants', []))
-                        })
-                except Exception as e:
-                    scrape_status['errors'].append({'error': str(e)})
-                
-                time.sleep(0.3)
+                if existing_info:
+                    # ===== 已存在：只更新價格 =====
+                    try:
+                        source_variants = product.get('variants', [])
+                        cnt = update_existing_product_price(existing_info['id'], source_variants)
+                        if cnt > 0:
+                            price_updated_count += 1
+                        
+                        # 確保 ACTIVE
+                        if existing_info.get('status') == 'DRAFT':
+                            set_product_active(existing_info['id'])
+                            # 重新發布
+                            pub_ids = get_all_publication_ids()
+                            if pub_ids:
+                                pub_mutation = """mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) { publishablePublish(id: $id, input: $input) { userErrors { field message } } }"""
+                                graphql_request(pub_mutation, {"id": existing_info['id'], "input": [{"publicationId": pid} for pid in pub_ids]})
+                        
+                        updated_count += 1
+                        print(f"[SYNC] ✓ 更新價格: {title}")
+                    except Exception as e:
+                        scrape_status['errors'].append({'error': f'更新失敗 {title}: {str(e)}'})
+                    
+                    time.sleep(0.2)
+                else:
+                    # ===== 新商品：翻譯 + 加入 Bulk Upload =====
+                    try:
+                        entry = product_to_jsonl_entry(product, cat_key, collection_id)
+                        if entry:
+                            new_entries.append(entry)
+                            scrape_status['products'].append({
+                                'title': entry['productSet']['title'],
+                                'handle': entry['productSet']['handle'],
+                                'variants': len(entry['productSet'].get('variants', []))
+                            })
+                            print(f"[SYNC] ✚ 新商品: {entry['productSet']['title'][:30]}")
+                    except Exception as e:
+                        scrape_status['errors'].append({'error': f'轉換失敗 {title}: {str(e)}'})
+                    
+                    time.sleep(0.3)
         
-        if not all_jsonl_entries:
-            raise Exception('沒有爬取到商品')
+        # 4. 新商品批量上傳
+        if new_entries:
+            jsonl_path = os.path.join(JSONL_DIR, f"bape_{category}_{int(time.time())}.jsonl")
+            with open(jsonl_path, 'w', encoding='utf-8') as f:
+                for entry in new_entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+            scrape_status['jsonl_file'] = jsonl_path
+            
+            scrape_status['phase'] = 'uploading'
+            scrape_status['current_product'] = f'批量上傳 {len(new_entries)} 個新商品...'
+            
+            staged = create_staged_upload()
+            if not staged:
+                raise Exception('建立 Staged Upload 失敗')
+            if not upload_jsonl_to_staged(staged, jsonl_path):
+                raise Exception('上傳 JSONL 失敗')
+            
+            staged_path = next((p['value'] for p in staged['parameters'] if p['name'] == 'key'), '')
+            result = run_bulk_mutation(staged_path)
+            
+            bulk_op = result.get('data', {}).get('bulkOperationRunMutation', {}).get('bulkOperation', {})
+            user_errors = result.get('data', {}).get('bulkOperationRunMutation', {}).get('userErrors', [])
+            if user_errors:
+                raise Exception(f'Bulk Mutation 錯誤: {user_errors}')
+            
+            scrape_status['bulk_operation_id'] = bulk_op.get('id', '')
+            
+            # 等待完成
+            scrape_status['current_product'] = '等待上傳完成...'
+            for _ in range(120):
+                status = check_bulk_operation_status()
+                scrape_status['bulk_status'] = status.get('status', '')
+                if status.get('status') == 'COMPLETED':
+                    break
+                elif status.get('status') in ['FAILED', 'CANCELED']:
+                    raise Exception(f'Bulk 失敗: {status.get("status")}')
+                time.sleep(5)
+            
+            # 發布新商品
+            scrape_status['phase'] = 'publishing'
+            scrape_status['current_product'] = '發布新商品...'
+            batch_publish_bape_products()
         
-        # 寫入 JSONL
-        jsonl_path = os.path.join(JSONL_DIR, f"bape_{category}_{int(time.time())}.jsonl")
-        with open(jsonl_path, 'w', encoding='utf-8') as f:
-            for entry in all_jsonl_entries:
-                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-        scrape_status['jsonl_file'] = jsonl_path
-        
-        # 批量上傳
-        print(f"[CRON] 批量上傳...")
-        scrape_status['current_product'] = '批量上傳...'
-        scrape_status['phase'] = 'uploading'
-        
-        staged = create_staged_upload()
-        if not staged or not upload_jsonl_to_staged(staged, jsonl_path):
-            raise Exception('上傳失敗')
-        
-        staged_path = next((p['value'] for p in staged['parameters'] if p['name'] == 'key'), '')
-        result = run_bulk_mutation(staged_path)
-        
-        bulk_op = result.get('data', {}).get('bulkOperationRunMutation', {}).get('bulkOperation', {})
-        user_errors = result.get('data', {}).get('bulkOperationRunMutation', {}).get('userErrors', [])
-        if user_errors:
-            raise Exception(f'Bulk Mutation 錯誤: {user_errors}')
-        
-        scrape_status['bulk_operation_id'] = bulk_op.get('id', '')
-        
-        # 等待完成
-        print(f"[CRON] 等待完成...")
-        scrape_status['current_product'] = '等待完成...'
-        
-        for _ in range(120):
-            status = check_bulk_operation_status()
-            scrape_status['bulk_status'] = status.get('status', '')
-            if status.get('status') == 'COMPLETED':
-                break
-            elif status.get('status') in ['FAILED', 'CANCELED']:
-                raise Exception(f'Bulk 失敗: {status.get("status")}')
-            time.sleep(5)
-        
-        # 發布
-        print(f"[CRON] 發布...")
-        scrape_status['current_product'] = '發布...'
-        scrape_status['phase'] = 'publishing'
-        batch_publish_bape_products()
-        
-        # 處理下架
-        print(f"[CRON] 處理下架...")
-        scrape_status['current_product'] = '處理下架...'
+        # 5. 下架：BAPE 沒有的商品設為草稿
         scrape_status['phase'] = 'drafting'
-        
+        scrape_status['current_product'] = '處理下架...'
         draft_count = 0
         for handle, product_info in existing_handles.items():
             if handle not in scraped_handles and product_info.get('status') == 'ACTIVE':
-                print(f"[CRON] 設為草稿: {handle}")
+                print(f"[SYNC] 🗑 下架: {handle} - {product_info.get('title', '')[:30]}")
                 if set_product_to_draft(product_info['id']):
                     draft_count += 1
                 time.sleep(0.2)
         
         scrape_status['set_to_draft'] = draft_count
-        scrape_status['current_product'] = f"✅ 完成！上傳 {len(all_jsonl_entries)} 個，下架 {draft_count} 個"
+        scrape_status['current_product'] = f"✅ 完成！新商品 {len(new_entries)} 個，更新 {updated_count} 個，下架 {draft_count} 個"
         scrape_status['phase'] = 'completed'
+        print(f"[SYNC] ✅ 新商品: {len(new_entries)}, 更新價格: {price_updated_count}, 下架: {draft_count}")
         
-        return {'success': True, 'total_products': len(all_jsonl_entries), 'set_to_draft': draft_count}
+        return {'success': True, 'new_products': len(new_entries), 'updated': updated_count, 'set_to_draft': draft_count}
         
     except Exception as e:
         scrape_status['errors'].append({'error': str(e)})
@@ -1443,21 +1042,13 @@ def index():
         
         <div class="card">
             <h2>⚡ 測試單品</h2>
-            <p style="color:#666;margin-bottom:10px;">測試單一商品上傳</p>
             <select id="testCat"><option value="mens">男裝</option><option value="womens">女裝</option><option value="kids">童裝</option></select>
             <button class="btn btn-warning" onclick="startTest()">🧪 測試單品</button>
         </div>
         
         <div class="card">
-            <h2>🧪 測試上架（每分類 10 個）</h2>
-            <p style="color:#666;margin-bottom:10px;">快速測試，每個分類只抓 10 個商品</p>
-            <select id="testSyncCat"><option value="all">全部</option><option value="mens">男裝</option><option value="womens">女裝</option><option value="kids">童裝</option></select>
-            <button class="btn btn-warning" onclick="startTestSync()">🧪 測試上架</button>
-        </div>
-        
-        <div class="card">
-            <h2>🔄 完整同步</h2>
-            <p style="color:#666;margin-bottom:10px;">爬取所有商品並同步到 Shopify</p>
+            <h2>🔄 智慧同步</h2>
+            <p style="color:#666;margin-bottom:10px;">新商品→翻譯上架 / 已存在→更新價格 / 下架→設草稿</p>
             <select id="syncCat"><option value="all">全部</option><option value="mens">男裝</option><option value="womens">女裝</option><option value="kids">童裝</option></select>
             <button class="btn btn-success" onclick="startSync()">🔄 開始同步</button>
         </div>
@@ -1471,7 +1062,7 @@ def index():
                 <div>目前：<span id="current">-</span></div>
             </div>
             <div class="stats">
-                <div class="stat-box"><div class="stat-value" id="productCount">0</div><div class="stat-label">已處理</div></div>
+                <div class="stat-box"><div class="stat-value" id="productCount">0</div><div class="stat-label">新商品</div></div>
                 <div class="stat-box"><div class="stat-value" id="draftCount">0</div><div class="stat-label">已下架</div></div>
                 <div class="stat-box"><div class="stat-value" id="errorCount">0</div><div class="stat-label">錯誤</div></div>
             </div>
@@ -1492,7 +1083,7 @@ def index():
         
         <div class="card danger-zone">
             <h2>⚠️ 危險區域</h2>
-            <p style="color:#666;margin-bottom:10px;">刪除操作無法復原，請謹慎使用</p>
+            <p style="color:#666;margin-bottom:10px;">刪除操作無法復原</p>
             <button class="btn btn-danger" onclick="deleteAll()">🗑️ 刪除所有 BAPE 商品</button>
         </div>
     </div>
@@ -1526,9 +1117,7 @@ def index():
                 if (!data.running) {
                     clearInterval(pollInterval);
                     if (data.phase === 'completed') log('✅ 完成！', 'success');
-                    if (data.errors && data.errors.length > 0) {
-                        data.errors.forEach(e => log('❌ ' + (e.error || JSON.stringify(e)), 'error'));
-                    }
+                    if (data.errors?.length > 0) data.errors.forEach(e => log('❌ ' + (e.error || JSON.stringify(e)), 'error'));
                 }
             } catch (e) { console.error(e); }
         }
@@ -1537,43 +1126,26 @@ def index():
             log('🧪 開始測試單品...');
             const res = await fetch('/api/test_single?category=' + document.getElementById('testCat').value);
             const data = await res.json();
-            if (data.success) {
-                log('測試已啟動', 'success');
-                pollInterval = setInterval(pollStatus, 1000);
-            } else log('❌ ' + (data.error || '啟動失敗'), 'error');
-        }
-        
-        async function startTestSync() {
-            log('🧪 開始測試上架（每分類 10 個）...');
-            const res = await fetch('/api/test_sync?category=' + document.getElementById('testSyncCat').value);
-            const data = await res.json();
-            if (data.success) {
-                log('測試上架已啟動', 'success');
-                pollInterval = setInterval(pollStatus, 1000);
-            } else log('❌ ' + (data.error || '啟動失敗'), 'error');
+            if (data.success) { log('測試已啟動', 'success'); pollInterval = setInterval(pollStatus, 1000); }
+            else log('❌ ' + (data.error || '啟動失敗'), 'error');
         }
         
         async function startSync() {
-            log('🔄 開始完整同步...');
+            log('🔄 開始智慧同步...');
             const res = await fetch('/api/auto_sync?category=' + document.getElementById('syncCat').value);
             const data = await res.json();
-            if (data.success) {
-                log('同步已啟動', 'success');
-                pollInterval = setInterval(pollStatus, 1000);
-            } else log('❌ ' + (data.error || '啟動失敗'), 'error');
+            if (data.success) { log('同步已啟動', 'success'); pollInterval = setInterval(pollStatus, 1000); }
+            else log('❌ ' + (data.error || '啟動失敗'), 'error');
         }
         
         async function deleteAll() {
-            if (!confirm('確定要刪除所有 BAPE 商品嗎？此操作無法復原！')) return;
-            if (!confirm('真的確定嗎？所有商品都會被刪除！')) return;
-            
-            log('🗑️ 開始刪除所有 BAPE 商品...', 'error');
+            if (!confirm('確定要刪除所有 BAPE 商品嗎？')) return;
+            if (!confirm('真的確定嗎？')) return;
+            log('🗑️ 開始刪除...', 'error');
             const res = await fetch('/api/delete_all');
             const data = await res.json();
-            if (data.success) {
-                log('刪除已啟動', 'success');
-                pollInterval = setInterval(pollStatus, 1000);
-            } else log('❌ ' + (data.error || '啟動失敗'), 'error');
+            if (data.success) { log('刪除已啟動', 'success'); pollInterval = setInterval(pollStatus, 1000); }
+            else log('❌ ' + (data.error || '啟動失敗'), 'error');
         }
         
         async function testShopify() {
@@ -1588,26 +1160,21 @@ def index():
             log('測試 BAPE...');
             const res = await fetch('/api/test_bape');
             const data = await res.json();
-            for (const [k, v] of Object.entries(data)) {
-                if (v.ok) log(`✅ ${k}: ${v.products_found} 個`, 'success');
-                else log(`❌ ${k}: ${v.error}`, 'error');
-            }
+            log(`總商品: ${data.total_products || 0}`, data.total_products ? 'success' : 'error');
         }
         
         async function countProducts() {
             const res = await fetch('/api/count');
             const data = await res.json();
-            log('商品數量: ' + data.count, 'success');
+            log('Shopify 商品數量: ' + data.count, 'success');
         }
         
         async function publishAll() {
             log('📢 發布所有商品...');
             const res = await fetch('/api/publish_all');
             const data = await res.json();
-            if (data.success) {
-                log('發布已啟動', 'success');
-                pollInterval = setInterval(pollStatus, 1000);
-            } else log('❌ ' + (data.error || '啟動失敗'), 'error');
+            if (data.success) { log('發布已啟動', 'success'); pollInterval = setInterval(pollStatus, 1000); }
+            else log('❌ ' + (data.error || '啟動失敗'), 'error');
         }
     </script>
 </body>
@@ -1636,26 +1203,6 @@ def api_test_single():
     return jsonify({'success': True})
 
 
-@app.route('/api/scrape')
-def api_scrape():
-    category = request.args.get('category', 'all')
-    if scrape_status.get('running'):
-        return jsonify({'success': False, 'error': '正在執行中'})
-    threading.Thread(target=run_scrape, args=(category,)).start()
-    return jsonify({'success': True})
-
-
-@app.route('/api/upload')
-def api_upload():
-    jsonl_file = request.args.get('file', '')
-    if not jsonl_file or not os.path.exists(jsonl_file):
-        return jsonify({'error': 'JSONL 不存在'})
-    if scrape_status['running']:
-        return jsonify({'error': '正在執行中'})
-    threading.Thread(target=run_bulk_upload, args=(jsonl_file,)).start()
-    return jsonify({'started': True})
-
-
 @app.route('/api/auto_sync')
 def api_auto_sync():
     category = request.args.get('category', 'all')
@@ -1665,12 +1212,14 @@ def api_auto_sync():
     return jsonify({'success': True})
 
 
-@app.route('/api/cron_sync')
-def api_cron_sync():
+@app.route('/api/cron')
+def api_cron():
+    """Cron Job 入口（背景執行）"""
     category = request.args.get('category', 'all')
     if scrape_status.get('running'):
         return jsonify({'success': False, 'error': '正在執行中'})
-    return jsonify(run_full_sync(category))
+    threading.Thread(target=run_full_sync, args=(category,)).start()
+    return jsonify({'success': True, 'message': '智慧同步已啟動'})
 
 
 @app.route('/api/bulk_status')
@@ -1702,7 +1251,6 @@ def api_publish_all():
 
 @app.route('/api/delete_all')
 def api_delete_all():
-    """刪除所有 BAPE 商品"""
     if scrape_status.get('running'):
         return jsonify({'error': '正在執行中'})
     
@@ -1712,37 +1260,20 @@ def api_delete_all():
         scrape_status['phase'] = 'deleting'
         scrape_status['progress'] = 0
         scrape_status['total'] = 0
-        scrape_status['current_product'] = '取得商品列表...'
         scrape_status['errors'] = []
-        
         try:
             products = fetch_bape_product_ids()
             scrape_status['total'] = len(products)
-            
             results = delete_all_bape_products()
-            scrape_status['current_product'] = f"✅ 刪除完成！已刪除 {results.get('deleted', 0)} 個商品"
+            scrape_status['current_product'] = f"✅ 已刪除 {results.get('deleted', 0)} 個商品"
         except Exception as e:
             scrape_status['errors'].append({'error': str(e)})
-            scrape_status['current_product'] = f"❌ 錯誤: {str(e)}"
         finally:
             scrape_status['running'] = False
             scrape_status['phase'] = 'completed'
     
     threading.Thread(target=run_delete).start()
-    return jsonify({'success': True, 'message': '已開始刪除'})
-
-
-@app.route('/api/test_sync')
-def api_test_sync():
-    """測試上架（每個分類只抓 10 個）"""
-    category = request.args.get('category', 'all')
-    limit = int(request.args.get('limit', 10))
-    
-    if scrape_status.get('running'):
-        return jsonify({'success': False, 'error': '正在執行中'})
-    
-    threading.Thread(target=run_test_sync, args=(category, limit)).start()
-    return jsonify({'success': True, 'message': f'測試上架已啟動（每分類 {limit} 個）'})
+    return jsonify({'success': True})
 
 
 @app.route('/api/count')
@@ -1752,549 +1283,16 @@ def api_count():
     return jsonify({'count': result.get('data', {}).get('productsCount', {}).get('count', 0)})
 
 
-@app.route('/api/check_bulk_result')
-def api_check_bulk_result():
-    """檢查最近的 Bulk Operation 結果"""
-    try:
-        # 查詢最近的 Bulk Operation
-        query = """query {
-            currentBulkOperation(type: MUTATION) {
-                id
-                status
-                errorCode
-                createdAt
-                completedAt
-                objectCount
-                fileSize
-                url
-                partialDataUrl
-            }
-        }"""
-        
-        result = graphql_request(query)
-        bulk_op = result.get('data', {}).get('currentBulkOperation')
-        
-        if not bulk_op:
-            # 嘗試查詢歷史記錄
-            history_query = """query {
-                bulkOperations(first: 5, type: MUTATION) {
-                    edges {
-                        node {
-                            id
-                            status
-                            errorCode
-                            createdAt
-                            completedAt
-                            objectCount
-                            fileSize
-                            url
-                            rootObjectCount
-                        }
-                    }
-                }
-            }"""
-            history_result = graphql_request(history_query)
-            return jsonify({
-                'current': None,
-                'history': history_result
-            })
-        
-        response = {'bulk_operation': bulk_op}
-        
-        # 如果有結果文件，嘗試下載
-        if bulk_op.get('url'):
-            try:
-                file_response = requests.get(bulk_op['url'], timeout=30)
-                if file_response.status_code == 200:
-                    # 只取前 5000 字元
-                    response['result_content'] = file_response.text[:5000]
-            except Exception as e:
-                response['result_error'] = str(e)
-        
-        return jsonify(response)
-        
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
-
-
-@app.route('/api/test_single_upload')
-def api_test_single_upload():
-    """測試單一商品上傳（不使用 Bulk Operation）"""
-    try:
-        # 取得一個商品
-        products = fetch_products_json(1)
-        if not products:
-            return jsonify({'error': '無法取得商品'})
-        
-        # 找一個有庫存的商品
-        test_product = None
-        for p in products:
-            has_stock = any(v.get('available', False) for v in p.get('variants', []))
-            if has_stock:
-                test_product = p
-                break
-        
-        if not test_product:
-            return jsonify({'error': '沒有有庫存的商品'})
-        
-        # 取得 Collection
-        collection_id = get_or_create_collection("BAPE Men's")
-        if not collection_id:
-            return jsonify({'error': '無法取得 Collection'})
-        
-        # 轉換商品
-        entry = product_to_jsonl_entry(test_product, 'mens', collection_id, None)
-        if not entry:
-            return jsonify({'error': '商品轉換失敗'})
-        
-        product_input = entry['productSet']
-        
-        # 直接使用 productSet mutation（同步模式）
-        mutation = """mutation productSet($input: ProductSetInput!, $synchronous: Boolean!) {
-            productSet(synchronous: $synchronous, input: $input) {
-                product {
-                    id
-                    title
-                    handle
-                    status
-                }
-                userErrors {
-                    field
-                    code
-                    message
-                }
-            }
-        }"""
-        
-        result = graphql_request(mutation, {"input": product_input, "synchronous": True})
-        
-        return jsonify({
-            'product_input': {
-                'title': product_input.get('title'),
-                'handle': product_input.get('handle'),
-                'vendor': product_input.get('vendor'),
-                'status': product_input.get('status'),
-                'variants_count': len(product_input.get('variants', [])),
-                'has_productCategory': 'productCategory' in product_input,
-                'collections': product_input.get('collections')
-            },
-            'result': result
-        })
-        
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
-
-
-@app.route('/api/test_category')
-def api_test_category():
-    """測試設定商品 Category"""
-    try:
-        # 先取得一個 BAPE 商品
-        products = fetch_bape_product_ids()
-        if not products:
-            return jsonify({'error': '沒有 BAPE 商品'})
-        
-        product = products[0]
-        product_id = product['id']
-        
-        results = []
-        
-        # 方法 1: 使用 productUpdate
-        mutation1 = """mutation productUpdate($input: ProductInput!) {
-            productUpdate(input: $input) {
-                product {
-                    id
-                    productCategory {
-                        productTaxonomyNode {
-                            id
-                            name
-                            fullName
-                        }
-                    }
-                }
-                userErrors { field message }
-            }
-        }"""
-        
-        result1 = graphql_request(mutation1, {
-            "input": {
-                "id": product_id,
-                "productCategory": {
-                    "productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/166"
-                }
-            }
-        })
-        results.append({'method': 'productUpdate', 'result': result1})
-        
-        # 方法 2: 使用 productSet 更新現有商品
-        mutation2 = """mutation productSet($input: ProductSetInput!) {
-            productSet(input: $input) {
-                product {
-                    id
-                    productCategory {
-                        productTaxonomyNode {
-                            id
-                            name
-                            fullName
-                        }
-                    }
-                }
-                userErrors { field message code }
-            }
-        }"""
-        
-        result2 = graphql_request(mutation2, {
-            "input": {
-                "id": product_id,
-                "productCategory": {
-                    "productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/166"
-                }
-            }
-        })
-        results.append({'method': 'productSet with id', 'result': result2})
-        
-        # 方法 3: 查詢 API 版本支援
-        version_query = """query {
-            shop {
-                name
-            }
-        }"""
-        version_result = graphql_request(version_query)
-        results.append({'method': 'API check', 'result': version_result})
-        
-        return jsonify({
-            'product_id': product_id,
-            'product_title': product['title'],
-            'api_version': '2024-10',
-            'test_results': results
-        })
-        
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
-
-
-@app.route('/api/check_taxonomy')
-def api_check_taxonomy():
-    """查詢 Shopify 商品分類 ID"""
-    try:
-        # 直接查詢特定的 taxonomy node
-        query = """query {
-            node1: productTaxonomyNode(id: "gid://shopify/ProductTaxonomyNode/1") {
-                id
-                name
-                fullName
-                isRoot
-            }
-            node166: productTaxonomyNode(id: "gid://shopify/ProductTaxonomyNode/166") {
-                id
-                name
-                fullName
-                isRoot
-            }
-            node212: productTaxonomyNode(id: "gid://shopify/ProductTaxonomyNode/212") {
-                id
-                name
-                fullName
-                isRoot
-            }
-        }"""
-        
-        result = graphql_request(query)
-        return jsonify(result)
-        
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
-
-
-@app.route('/api/force_publish')
-def api_force_publish():
-    """強制發布所有 BAPE 商品到所有渠道，並設定 Category"""
-    try:
-        # 取得所有 publications
-        publications = get_all_publications()
-        if not publications:
-            return jsonify({'error': '無法取得 Publications'})
-        
-        print(f"[PUBLISH] 找到 {len(publications)} 個 Publications:", flush=True)
-        for pub in publications:
-            print(f"  - {pub['name']} ({pub['id']})", flush=True)
-        
-        # 取得所有 BAPE 商品
-        products = fetch_bape_product_ids()
-        print(f"[PUBLISH] 找到 {len(products)} 個 BAPE 商品", flush=True)
-        
-        if not products:
-            return jsonify({'error': '沒有找到 BAPE 商品'})
-        
-        # 發布每個商品
-        success_count = 0
-        category_count = 0
-        errors = []
-        
-        for product in products:
-            product_id = product['id']
-            print(f"[PUBLISH] 處理: {product['title'][:30]}...", flush=True)
-            
-            # 設為 ACTIVE 並設定 Category
-            update_mutation = """mutation productUpdate($input: ProductInput!) {
-                productUpdate(input: $input) {
-                    product { id status }
-                    userErrors { field message }
-                }
-            }"""
-            
-            update_result = graphql_request(update_mutation, {
-                "input": {
-                    "id": product_id,
-                    "status": "ACTIVE",
-                    "productCategory": {
-                        "productTaxonomyNodeId": "gid://shopify/ProductTaxonomyNode/1"
-                    }
-                }
-            })
-            
-            update_errors = update_result.get('data', {}).get('productUpdate', {}).get('userErrors', [])
-            if update_errors:
-                errors.append(f"{product['title']}: {update_errors}")
-            else:
-                category_count += 1
-            
-            # 發布到所有渠道
-            pub_mutation = """mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
-                publishablePublish(id: $id, input: $input) {
-                    userErrors { field message }
-                }
-            }"""
-            
-            pub_result = graphql_request(pub_mutation, {
-                "id": product_id,
-                "input": [{"publicationId": pub['id']} for pub in publications]
-            })
-            
-            pub_errors = pub_result.get('data', {}).get('publishablePublish', {}).get('userErrors', [])
-            if pub_errors:
-                errors.append(f"{product['title']}: {pub_errors}")
-            else:
-                success_count += 1
-            
-            time.sleep(0.2)
-        
-        return jsonify({
-            'success': True,
-            'total': len(products),
-            'published': success_count,
-            'category_set': category_count,
-            'errors': errors
-        })
-        
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
-
-
-@app.route('/api/check_products')
-def api_check_products():
-    """檢查 Shopify 上的 BAPE 商品狀態"""
-    try:
-        # 查詢 BAPE 商品
-        query = """query {
-            products(first: 50, query: "vendor:BAPE") {
-                edges {
-                    node {
-                        id
-                        title
-                        handle
-                        status
-                        publishedAt
-                        totalInventory
-                        collections(first: 5) {
-                            edges {
-                                node {
-                                    title
-                                }
-                            }
-                        }
-                        resourcePublicationsV2(first: 5) {
-                            edges {
-                                node {
-                                    publication {
-                                        name
-                                    }
-                                    isPublished
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }"""
-        
-        result = graphql_request(query)
-        products = result.get('data', {}).get('products', {}).get('edges', [])
-        
-        product_list = []
-        for edge in products:
-            node = edge['node']
-            collections = [c['node']['title'] for c in node.get('collections', {}).get('edges', [])]
-            publications = []
-            for pub in node.get('resourcePublicationsV2', {}).get('edges', []):
-                pub_node = pub['node']
-                publications.append({
-                    'name': pub_node.get('publication', {}).get('name', ''),
-                    'isPublished': pub_node.get('isPublished', False)
-                })
-            
-            product_list.append({
-                'id': node['id'],
-                'title': node['title'][:50],
-                'handle': node['handle'],
-                'status': node['status'],
-                'publishedAt': node['publishedAt'],
-                'totalInventory': node['totalInventory'],
-                'collections': collections,
-                'publications': publications
-            })
-        
-        return jsonify({
-            'total': len(product_list),
-            'products': product_list
-        })
-        
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'traceback': traceback.format_exc()})
-
-
 @app.route('/api/test_bape')
 def api_test_bape():
-    """測試連線到 jp.bape.com 並顯示分類統計"""
     results = {}
-    
     try:
-        # 先測試基本連線
-        url = f"{SOURCE_URL}/collections/all/products.json?page=1&limit=10"
-        print(f"[TEST BAPE] 測試連線: {url}")
-        
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        
-        results['connection'] = {
-            'url': url,
-            'status': response.status_code,
-            'ok': response.status_code == 200
-        }
-        
-        if response.status_code == 200:
-            # 取得所有商品並分類
-            all_by_category = fetch_all_products_by_category()
-            
-            results['categories'] = {
-                'mens': {
-                    'name': 'メンズ（男裝）',
-                    'count': len(all_by_category.get('mens', []))
-                },
-                'womens': {
-                    'name': 'レディース（女裝）',
-                    'count': len(all_by_category.get('womens', []))
-                },
-                'kids': {
-                    'name': 'キッズ（童裝）',
-                    'count': len(all_by_category.get('kids', []))
-                }
-            }
-            
-            total = sum(len(v) for v in all_by_category.values())
-            results['total_products'] = total
-            
-            # 顯示每個分類的前 3 個商品
-            for cat_key in ['mens', 'womens', 'kids']:
-                products = all_by_category.get(cat_key, [])[:3]
-                results['categories'][cat_key]['samples'] = [
-                    {'title': p.get('title', '')[:50], 'handle': p.get('handle', '')}
-                    for p in products
-                ]
-        
-    except requests.exceptions.Timeout:
-        results['error'] = '連線超時'
-    except requests.exceptions.ConnectionError as e:
-        results['error'] = f'連線失敗: {str(e)[:100]}'
+        all_by_category = fetch_all_products_by_category()
+        results['total_products'] = sum(len(v) for v in all_by_category.values())
+        results['categories'] = {k: len(v) for k, v in all_by_category.items()}
     except Exception as e:
         results['error'] = str(e)
-        import traceback
-        results['traceback'] = traceback.format_exc()
-    
     return jsonify(results)
-
-
-@app.route('/api/test_html')
-def api_test_html():
-    """直接測試 HTML 爬取"""
-    category = request.args.get('category', 'mens')
-    
-    if category not in CATEGORIES:
-        return jsonify({'error': f'無效分類: {category}'})
-    
-    cat_info = CATEGORIES[category]
-    url = f"{SOURCE_URL}{cat_info['base_url']}?{cat_info['filter']}"
-    
-    result = {
-        'category': category,
-        'url': url
-    }
-    
-    try:
-        print(f"[TEST HTML] 請求: {url}")
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        
-        result['status'] = response.status_code
-        result['content_length'] = len(response.text)
-        result['headers'] = dict(response.headers)
-        
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # 頁面標題
-            title = soup.find('title')
-            result['page_title'] = title.get_text()[:100] if title else None
-            
-            # 所有連結
-            all_links = soup.find_all('a', href=True)
-            result['total_links'] = len(all_links)
-            
-            # 商品連結
-            product_handles = []
-            for link in all_links:
-                href = link.get('href', '')
-                if '/products/' in href:
-                    match = re.search(r'/products/([^/?#]+)', href)
-                    if match and match.group(1) != 'products':
-                        if match.group(1) not in product_handles:
-                            product_handles.append(match.group(1))
-            
-            result['products_found'] = len(product_handles)
-            result['product_handles'] = product_handles[:20]
-            
-            # 連結樣本
-            result['sample_links'] = [a.get('href', '')[:80] for a in all_links[:30]]
-            
-            # HTML 片段（前 2000 字元）
-            result['html_preview'] = response.text[:2000]
-        else:
-            result['response_text'] = response.text[:1000]
-            
-    except requests.exceptions.Timeout:
-        result['error'] = '連線超時 (30秒)'
-    except requests.exceptions.ConnectionError as e:
-        result['error'] = f'連線失敗: {str(e)}'
-    except Exception as e:
-        result['error'] = str(e)
-        import traceback
-        result['traceback'] = traceback.format_exc()
-    
-    return jsonify(result)
 
 
 if __name__ == '__main__':

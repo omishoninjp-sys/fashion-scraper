@@ -421,7 +421,7 @@ def parse_product_page(url):
         print(f"[ERROR] 解析失敗 {url}: {e}")
         return None
 
-def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
+def product_to_jsonl_entry(product_data, tags, category_key, collection_id, existing_product_id=None):
     PRODUCT_TYPES = {'work': 'WORKMAN 作業服', 'mens': 'WORKMAN 男裝', 'womens': 'WORKMAN 女裝', 'kids': 'WORKMAN 兒童'}
     product_type = PRODUCT_TYPES.get(category_key, 'WORKMAN')
     translated = translate_with_chatgpt(product_data['title'], product_data['description'], product_data.get('size_spec', ''))
@@ -473,21 +473,21 @@ def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
     if has_color_option and has_size_option:
         for color in colors:
             for size in sizes:
-                v = {"price": selling_price, "sku": f"{manage_code}-{color}-{size}", "inventoryPolicy": "DENY", "taxable": False, "inventoryItem": {"cost": cost}, "optionValues": [{"optionName": "顏色", "name": color}, {"optionName": "尺寸", "name": size}]}
+                v = {"price": selling_price, "sku": f"{manage_code}-{color}-{size}", "inventoryPolicy": "CONTINUE", "taxable": False, "inventoryItem": {"cost": cost}, "optionValues": [{"optionName": "顏色", "name": color}, {"optionName": "尺寸", "name": size}]}
                 if variant_file: v["file"] = variant_file
                 variants.append(v)
     elif has_color_option:
         for color in colors:
-            v = {"price": selling_price, "sku": f"{manage_code}-{color}", "inventoryPolicy": "DENY", "taxable": False, "inventoryItem": {"cost": cost}, "optionValues": [{"optionName": "顏色", "name": color}]}
+            v = {"price": selling_price, "sku": f"{manage_code}-{color}", "inventoryPolicy": "CONTINUE", "taxable": False, "inventoryItem": {"cost": cost}, "optionValues": [{"optionName": "顏色", "name": color}]}
             if variant_file: v["file"] = variant_file
             variants.append(v)
     elif has_size_option:
         for size in sizes:
-            v = {"price": selling_price, "sku": f"{manage_code}-{size}", "inventoryPolicy": "DENY", "taxable": False, "inventoryItem": {"cost": cost}, "optionValues": [{"optionName": "尺寸", "name": size}]}
+            v = {"price": selling_price, "sku": f"{manage_code}-{size}", "inventoryPolicy": "CONTINUE", "taxable": False, "inventoryItem": {"cost": cost}, "optionValues": [{"optionName": "尺寸", "name": size}]}
             if variant_file: v["file"] = variant_file
             variants.append(v)
     else:
-        v = {"price": selling_price, "sku": manage_code, "inventoryPolicy": "DENY", "taxable": False, "inventoryItem": {"cost": cost}}
+        v = {"price": selling_price, "sku": manage_code, "inventoryPolicy": "CONTINUE", "taxable": False, "inventoryItem": {"cost": cost}}
         if variant_file: v["file"] = variant_file
         variants.append(v)
     seo_title = f"{title} | WORKMAN 日本代購"
@@ -498,6 +498,7 @@ def product_to_jsonl_entry(product_data, tags, category_key, collection_id):
         "seo": {"title": seo_title, "description": seo_description},
         "metafields": [{"namespace": "custom", "key": "link", "value": source_url, "type": "url"}]
     }
+    if existing_product_id: product_input["id"] = existing_product_id
     if collection_id: product_input["collections"] = [collection_id]
     if product_options: product_input["productOptions"] = product_options
     if variants: product_input["variants"] = variants
@@ -606,15 +607,15 @@ def fetch_workman_product_ids():
     cursor = None
     while True:
         if cursor:
-            query = 'query($cursor: String) { products(first: 250, after: $cursor, query: "vendor:WORKMAN") { edges { node { id title handle } cursor } pageInfo { hasNextPage } } }'
+            query = 'query($cursor: String) { products(first: 250, after: $cursor, query: "vendor:WORKMAN") { edges { node { id title handle status } cursor } pageInfo { hasNextPage } } }'
             result = graphql_request(query, {"cursor": cursor})
         else:
-            query = '{ products(first: 250, query: "vendor:WORKMAN") { edges { node { id title handle } cursor } pageInfo { hasNextPage } } }'
+            query = '{ products(first: 250, query: "vendor:WORKMAN") { edges { node { id title handle status } cursor } pageInfo { hasNextPage } } }'
             result = graphql_request(query)
         edges = result.get('data', {}).get('products', {}).get('edges', [])
         for edge in edges:
             node = edge['node']
-            all_ids.append({'id': node['id'], 'title': node['title'], 'handle': node['handle']})
+            all_ids.append({'id': node['id'], 'title': node['title'], 'handle': node['handle'], 'status': node.get('status', '')})
             cursor = edge['cursor']
         if not result.get('data', {}).get('products', {}).get('pageInfo', {}).get('hasNextPage', False):
             break
@@ -914,13 +915,109 @@ def run_bulk_upload(jsonl_path):
     finally:
         scrape_status['running'] = False
 
+def update_existing_product_price(product_id, product_data):
+    """已存在的商品：只更新價格，不重新翻譯"""
+    cost = product_data['price']
+    selling_price = calculate_selling_price(cost, DEFAULT_WEIGHT)
+    
+    # 取得商品的所有 variants
+    query = f"""
+    {{
+      product(id: "{product_id}") {{
+        variants(first: 100) {{
+          edges {{
+            node {{
+              id
+              sku
+              inventoryItem {{
+                id
+                inventoryLevels(first: 5) {{
+                  edges {{
+                    node {{
+                      id
+                      location {{ id }}
+                      quantities(names: ["available"]) {{ name quantity }}
+                    }}
+                  }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+    result = graphql_request(query)
+    variants = result.get('data', {}).get('product', {}).get('variants', {}).get('edges', [])
+    
+    updated_variants = 0
+    for v_edge in variants:
+        v_node = v_edge['node']
+        variant_id = v_node['id']
+        
+        # 更新價格
+        mutation = """mutation productVariantUpdate($input: ProductVariantInput!) {
+            productVariantUpdate(input: $input) {
+                productVariant { id }
+                userErrors { field message }
+            }
+        }"""
+        graphql_request(mutation, {"input": {"id": variant_id, "price": str(selling_price)}})
+        updated_variants += 1
+        time.sleep(0.1)
+    
+    return updated_variants
+
+
+def set_variant_inventory_available(inventory_item_id, location_id, quantity=10):
+    """將 variant 庫存設為有貨（預設 10）"""
+    mutation = """mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
+        inventorySetQuantities(input: $input) {
+            inventoryAdjustmentGroup { reason }
+            userErrors { field message }
+        }
+    }"""
+    result = graphql_request(mutation, {"input": {"reason": "correction", "name": "available", "quantities": [{"inventoryItemId": inventory_item_id, "locationId": location_id, "quantity": quantity}]}})
+    errors = result.get('data', {}).get('inventorySetQuantities', {}).get('userErrors', [])
+    return len(errors) == 0
+
+
+def set_product_active(product_id):
+    """將商品設為 ACTIVE"""
+    mutation = """mutation productUpdate($input: ProductInput!) { productUpdate(input: $input) { product { id status } userErrors { field message } } }"""
+    result = graphql_request(mutation, {"input": {"id": product_id, "status": "ACTIVE"}})
+    errors = result.get('data', {}).get('productUpdate', {}).get('userErrors', [])
+    return len(errors) == 0
+
+
 def run_full_sync(category='all'):
+    """
+    智慧同步：
+    1. 爬 workman.jp 取得所有商品連結
+    2. 比對 Shopify 現有商品
+    3. 新商品 → 翻譯 + 上架
+    4. 已存在 + 有貨 → 只更新價格，庫存設有貨
+    5. 已存在 + 缺貨（parse 回傳 None）→ 庫存歸零 + 設草稿
+    6. workman 沒有、Shopify 有 → 設草稿
+    """
     global scrape_status
-    scrape_status = {"running": True, "phase": "cron_sync", "progress": 0, "total": 0, "current_product": "開始自動化同步...", "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": ""}
+    scrape_status = {"running": True, "phase": "cron_sync", "progress": 0, "total": 0, "current_product": "開始智慧同步...", "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "set_to_draft": 0}
     try:
         cats = ['work', 'mens', 'womens', 'kids'] if category == 'all' else [category] if category in CATEGORIES else []
         if not cats: raise Exception(f'未知分類: {category}')
-        all_entries = []
+        
+        # 1. 取得 Shopify 現有商品（含 inventory 資料）
+        scrape_status['current_product'] = '取得 Shopify 現有商品...'
+        existing_products = fetch_workman_products_with_source()
+        existing_handles = {p['handle']: p for p in existing_products}
+        print(f"[SYNC] Shopify 現有 {len(existing_handles)} 個 WORKMAN 商品")
+        
+        # 2. 爬取 + 比對
+        new_entries = []  # 新商品用 Bulk Upload
+        scraped_handles = set()
+        updated_count = 0
+        price_updated_count = 0
+        
         for cat_key in cats:
             cat_info = CATEGORIES[cat_key]
             collection_id = get_or_create_collection(cat_info['collection'])
@@ -928,53 +1025,144 @@ def run_full_sync(category='all'):
             product_links = fetch_all_product_links(cat_key)
             if not product_links: continue
             scrape_status['total'] += len(product_links)
+            
             for link in product_links:
                 scrape_status['progress'] += 1
-                scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {link.split('/')[-2]}"
-                product_data = parse_product_page(link)
-                if not product_data: continue
-                try:
-                    entry = product_to_jsonl_entry(product_data, cat_info['tags'], cat_key, collection_id)
-                    all_entries.append(entry)
-                    scrape_status['products'].append({'title': entry['productSet']['title'], 'handle': entry['productSet']['handle'], 'variants': len(entry['productSet'].get('variants', []))})
-                except Exception as e:
-                    scrape_status['errors'].append({'url': link, 'error': str(e)})
-                time.sleep(0.5)
-        if not all_entries: raise Exception('沒有爬取到任何商品')
-        jsonl_path = os.path.join(JSONL_DIR, f"workman_{category}_{int(time.time())}.jsonl")
-        with open(jsonl_path, 'w', encoding='utf-8') as f:
-            for entry in all_entries:
-                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
-        scrape_status['jsonl_file'] = jsonl_path
-        # Upload
-        scrape_status['phase'] = 'uploading'
-        staged = create_staged_upload()
-        if not staged: raise Exception('建立 Staged Upload 失敗')
-        if not upload_jsonl_to_staged(staged, jsonl_path): raise Exception('上傳 JSONL 失敗')
-        staged_path = None
-        for param in staged['parameters']:
-            if param['name'] == 'key': staged_path = param['value']; break
-        if not staged_path: staged_path = staged.get('resourceUrl', '')
-        result = run_bulk_mutation(staged_path)
-        if 'errors' in result: raise Exception(f'Bulk Mutation 錯誤: {result["errors"]}')
-        bulk_op = result.get('data', {}).get('bulkOperationRunMutation', {}).get('bulkOperation', {})
-        user_errors = result.get('data', {}).get('bulkOperationRunMutation', {}).get('userErrors', [])
-        if user_errors: raise Exception(f'userErrors: {user_errors}')
-        scrape_status['bulk_operation_id'] = bulk_op.get('id', '')
-        # Wait
-        max_wait, wait_time = 600, 0
-        while wait_time < max_wait:
-            status = check_bulk_operation_status()
-            if status.get('status') == 'COMPLETED': break
-            elif status.get('status') in ['FAILED', 'CANCELED']: raise Exception(f'失敗: {status.get("status")}')
-            time.sleep(5); wait_time += 5
-        if wait_time >= max_wait: raise Exception('超時')
-        # Publish
-        scrape_status['phase'] = 'publishing'
-        publish_result = batch_publish_workman_products()
-        scrape_status['current_product'] = f"✅ 同步完成！共 {len(all_entries)} 個商品"
+                code = link.split('/')[-2] if link.endswith('/') else link.split('/')[-1]
+                scrape_status['current_product'] = f"[{scrape_status['progress']}/{scrape_status['total']}] {code}"
+                
+                # 從 URL 取得 manage_code
+                match = re.search(r'/g/g(\d+)/', link)
+                manage_code = match.group(1) if match else ''
+                my_handle = f"workman-{manage_code}" if manage_code else ''
+                
+                existing_info = existing_handles.get(my_handle) if my_handle else None
+                
+                if existing_info:
+                    # ===== 已存在的商品：只檢查庫存 + 更新價格 =====
+                    scraped_handles.add(my_handle)
+                    
+                    # 檢查官網庫存（用簡單的 HTTP GET，不需要完整 parse）
+                    stock = check_workman_stock(link)
+                    
+                    if stock['available']:
+                        # 有貨 → 只更新價格 + 確保 ACTIVE
+                        try:
+                            response = requests.get(link, headers=HEADERS, timeout=30)
+                            if response.status_code == 200:
+                                soup = BeautifulSoup(response.text, 'html.parser')
+                                price_elem = soup.find('p', class_='block-goods-price')
+                                if not price_elem:
+                                    price_elem = soup.find(class_=re.compile(r'price'))
+                                if price_elem:
+                                    price_match = re.search(r'[\d,]+', price_elem.get_text(strip=True))
+                                    if price_match:
+                                        new_price = int(price_match.group().replace(',', ''))
+                                        product_data_simple = {'price': new_price}
+                                        update_existing_product_price(existing_info['id'], product_data_simple)
+                                        price_updated_count += 1
+                            
+                            # 確保商品是 ACTIVE（可能之前被設為草稿）
+                            if existing_info.get('status') == 'DRAFT':
+                                set_product_active(existing_info['id'])
+                                # 重新發布
+                                publications = get_all_publication_ids()
+                                if publications:
+                                    pub_mutation = """mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) { publishablePublish(id: $id, input: $input) { userErrors { field message } } }"""
+                                    graphql_request(pub_mutation, {"id": existing_info['id'], "input": [{"publicationId": pid} for pid in publications]})
+                            
+                            updated_count += 1
+                            print(f"[SYNC] ✓ 更新價格: {existing_info['title'][:30]}")
+                        except Exception as e:
+                            scrape_status['errors'].append({'url': link, 'error': f'更新失敗: {str(e)}'})
+                    else:
+                        # 缺貨 → 庫存歸零 + 設草稿
+                        print(f"[SYNC] ❌ 缺貨，下架: {existing_info['title'][:30]} ({stock['out_of_stock_reason']})")
+                        for variant in existing_info.get('variants', []):
+                            for level in variant.get('inventory_levels', []):
+                                if level['available'] > 0:
+                                    zero_variant_inventory(variant['inventory_item_id'], level['location_id'])
+                        if existing_info.get('status') != 'DRAFT':
+                            set_product_to_draft(existing_info['id'])
+                    
+                    time.sleep(0.3)
+                else:
+                    # ===== 新商品：完整爬取 + 翻譯 + 加入 Bulk Upload =====
+                    product_data = parse_product_page(link)
+                    if not product_data: continue
+                    
+                    if manage_code:
+                        scraped_handles.add(f"workman-{product_data['manage_code']}")
+                    
+                    try:
+                        entry = product_to_jsonl_entry(product_data, cat_info['tags'], cat_key, collection_id)
+                        new_entries.append(entry)
+                        scrape_status['products'].append({'title': entry['productSet']['title'], 'handle': entry['productSet']['handle'], 'variants': len(entry['productSet'].get('variants', []))})
+                        print(f"[SYNC] ✚ 新商品: {entry['productSet']['title'][:30]}")
+                    except Exception as e:
+                        scrape_status['errors'].append({'url': link, 'error': str(e)})
+                    time.sleep(0.5)
+        
+        # 3. 新商品批量上傳
+        if new_entries:
+            jsonl_path = os.path.join(JSONL_DIR, f"workman_{category}_{int(time.time())}.jsonl")
+            with open(jsonl_path, 'w', encoding='utf-8') as f:
+                for entry in new_entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+            scrape_status['jsonl_file'] = jsonl_path
+            
+            scrape_status['phase'] = 'uploading'
+            scrape_status['current_product'] = f'批量上傳 {len(new_entries)} 個新商品...'
+            staged = create_staged_upload()
+            if not staged: raise Exception('建立 Staged Upload 失敗')
+            if not upload_jsonl_to_staged(staged, jsonl_path): raise Exception('上傳 JSONL 失敗')
+            staged_path = None
+            for param in staged['parameters']:
+                if param['name'] == 'key': staged_path = param['value']; break
+            if not staged_path: staged_path = staged.get('resourceUrl', '')
+            result = run_bulk_mutation(staged_path)
+            if 'errors' in result: raise Exception(f'Bulk Mutation 錯誤: {result["errors"]}')
+            bulk_op = result.get('data', {}).get('bulkOperationRunMutation', {}).get('bulkOperation', {})
+            user_errors = result.get('data', {}).get('bulkOperationRunMutation', {}).get('userErrors', [])
+            if user_errors: raise Exception(f'userErrors: {user_errors}')
+            scrape_status['bulk_operation_id'] = bulk_op.get('id', '')
+            
+            # 等待完成
+            scrape_status['current_product'] = '等待上傳完成...'
+            max_wait, wait_time = 600, 0
+            while wait_time < max_wait:
+                status = check_bulk_operation_status()
+                if status.get('status') == 'COMPLETED': break
+                elif status.get('status') in ['FAILED', 'CANCELED']: raise Exception(f'失敗: {status.get("status")}')
+                time.sleep(5); wait_time += 5
+            if wait_time >= max_wait: raise Exception('超時')
+            
+            # 發布新商品
+            scrape_status['phase'] = 'publishing'
+            scrape_status['current_product'] = '發布新商品...'
+            batch_publish_workman_products()
+        
+        # 4. 下架：workman 沒有的商品設為草稿
+        scrape_status['phase'] = 'drafting'
+        scrape_status['current_product'] = '處理下架...'
+        draft_count = 0
+        for handle, product_info in existing_handles.items():
+            if handle not in scraped_handles and product_info.get('status', '') == 'ACTIVE':
+                print(f"[SYNC] 🗑 下架: {handle} - {product_info.get('title', '')[:30]}")
+                # 庫存歸零
+                for variant in product_info.get('variants', []):
+                    for level in variant.get('inventory_levels', []):
+                        if level['available'] > 0:
+                            zero_variant_inventory(variant['inventory_item_id'], level['location_id'])
+                if set_product_to_draft(product_info['id']):
+                    draft_count += 1
+                time.sleep(0.2)
+        
+        scrape_status['set_to_draft'] = draft_count
+        scrape_status['current_product'] = f"✅ 完成！新商品 {len(new_entries)} 個，更新 {updated_count} 個，下架 {draft_count} 個"
         scrape_status['phase'] = 'completed'
-        return {'success': True, 'total_products': len(all_entries), 'published': publish_result.get('success', 0)}
+        print(f"[SYNC] ✅ 新商品: {len(new_entries)}, 更新價格: {price_updated_count}, 下架: {draft_count}")
+        return {'success': True, 'new_products': len(new_entries), 'updated': updated_count, 'set_to_draft': draft_count}
     except Exception as e:
         scrape_status['errors'].append({'error': str(e)})
         scrape_status['phase'] = 'error'

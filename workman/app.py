@@ -46,6 +46,9 @@ OUT_OF_STOCK_KEYWORDS = [
     '店舗のみのお取り扱い',
     'オンラインストア販売終了',
     '店舗在庫を確認する',
+    '予約受付は終了',
+    '受付終了',
+    '取り扱いを終了',
 ]
 
 os.makedirs(JSONL_DIR, exist_ok=True)
@@ -318,7 +321,7 @@ def parse_product_page(url):
                 print(f"[跳過] 缺貨（{keyword}）: {url}")
                 return None
         if '売り切れ' in page_text or '品切れ' in page_text:
-            print(f"[跳過] 缺貨（売り切れ/品切れ）: {url}")
+            print(f"[跳過] 缺貨（売り切れ/品切れ/予約受付は終了）: {url}")
             return None
         # === 缺貨檢查結束 ===
         title = ''
@@ -721,7 +724,7 @@ def check_workman_stock(product_url):
             if keyword in page_text:
                 return {'available': False, 'page_exists': True, 'out_of_stock_reason': keyword}
         if '売り切れ' in page_text or '品切れ' in page_text:
-            return {'available': False, 'page_exists': True, 'out_of_stock_reason': '売り切れ / 品切れ'}
+            return {'available': False, 'page_exists': True, 'out_of_stock_reason': '売り切れ / 品切れ / 予約受付は終了'}
         return result
     except requests.exceptions.Timeout:
         return {'available': True, 'page_exists': True, 'out_of_stock_reason': '連線超時（暫不處理）'}

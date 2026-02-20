@@ -1,11 +1,12 @@
 """
-WORKMAN 商品爬蟲 + Shopify Bulk Operations 上架工具 v2.2
+WORKMAN 商品爬蟲 + Shopify Bulk Operations 上架工具 v2.3
 來源：workman.jp
 功能：
 1. 爬取 workman.jp 各分類商品
 2. 翻譯並產生 JSONL 檔案
 3. 使用 Shopify Bulk Operations API 批量上傳
 4. v2.2: 缺貨/下架商品直接刪除（不設草稿）
+5. v2.3: variant 級別同步 — 刪除缺貨的個別選項（顏色/尺寸）
 """
 
 from flask import Flask, jsonify, send_file
@@ -42,13 +43,13 @@ scrape_status = {"running": False, "phase": "", "progress": 0, "total": 0, "curr
     "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": ""}
 
 inventory_sync_status = {"running": False, "phase": "", "progress": 0, "total": 0, "current_product": "",
-    "results": {"checked": 0, "in_stock": 0, "out_of_stock": 0, "deleted": 0, "inventory_zeroed": 0, "errors": 0, "page_gone": 0},
+    "results": {"checked": 0, "in_stock": 0, "out_of_stock": 0, "deleted": 0, "inventory_zeroed": 0, "errors": 0, "page_gone": 0, "variants_deleted": 0},
     "details": [], "errors": []}
 
 def reset_inventory_sync_status():
     global inventory_sync_status
     inventory_sync_status = {"running": False, "phase": "", "progress": 0, "total": 0, "current_product": "",
-        "results": {"checked": 0, "in_stock": 0, "out_of_stock": 0, "deleted": 0, "inventory_zeroed": 0, "errors": 0, "page_gone": 0},
+        "results": {"checked": 0, "in_stock": 0, "out_of_stock": 0, "deleted": 0, "inventory_zeroed": 0, "errors": 0, "page_gone": 0, "variants_deleted": 0},
         "details": [], "errors": []}
 
 
@@ -205,6 +206,108 @@ def fetch_all_product_links(category_key):
     print(f"[INFO] {category['collection']} 共 {len(all_links)} 個商品")
     return all_links
 
+
+def parse_color_sizes_from_spec(soup):
+    """
+    v2.3: 從規格表解析每個顏色對應的尺寸
+    回傳 dict: { '顏色名': ['S', 'M', 'L', ...], ... }
+    如果無法解析，回傳 None
+    """
+    color_sizes = {}
+    spec_dt = soup.find('dt', string='サイズ・スペック')
+    if not spec_dt:
+        return None
+
+    spec_dd = spec_dt.find_next_sibling('dd')
+    if not spec_dd:
+        return None
+
+    tables = spec_dd.find_all('table')
+    if not tables:
+        return None
+
+    for table in tables:
+        rows = table.find_all('tr')
+        if not rows:
+            continue
+
+        # 第一行的 header 包含顏色名和尺寸
+        first_row = rows[0]
+        headers = [cell.get_text(strip=True) for cell in first_row.find_all(['th', 'td'])]
+
+        if not headers:
+            continue
+
+        # 規格表的結構：
+        # 1. 標題行可能是 "顏色名 | | S | M | L | LL | 3L" 
+        #    其中第一個 cell 是顏色名（可能跨多行），後面是尺寸
+        # 2. 也可能是 "サイズ | S | M | L | LL | 3L"
+
+        # 找出尺寸名稱（通常在第一行 headers）
+        # 尺寸格式：S, M, L, LL, 3L, 4L, 5L, 7L, FREE, フリー 等
+        size_pattern = re.compile(r'^(S|M|L|LL|3L|4L|5L|7L|FREE|フリー|SS|XS|XL|XXL|\d+(?:\.\d+)?cm?)$', re.IGNORECASE)
+
+        sizes_in_table = []
+        size_start_idx = -1
+        for idx, h in enumerate(headers):
+            if size_pattern.match(h.strip()):
+                if size_start_idx == -1:
+                    size_start_idx = idx
+                sizes_in_table.append(h.strip())
+
+        if not sizes_in_table:
+            continue
+
+        # 嘗試從第一個 header cell 提取顏色名
+        # 顏色名通常在第一個 cell，可能包含多個顏色（用空格或換行分隔）
+        color_text = headers[0] if headers else ''
+
+        # 如果第一個 cell 是像 "リミテッドブラック ライディングライムG プロブラック" 這樣
+        # 也可能是 "サイズ" 或空
+        if color_text in ('サイズ', '対応サイズ', '対応身長', '対応胸囲', '製品サイズ', ''):
+            # 沒有顏色名，這是通用尺寸表
+            # 把所有尺寸歸到 '__all__' key
+            if '__all__' not in color_sizes:
+                color_sizes['__all__'] = set()
+            for s in sizes_in_table:
+                color_sizes['__all__'].add(s)
+        else:
+            # 有顏色名 — 可能是多個顏色共用同一個表
+            # 例如 "リミテッドブラック ライディングライムG プロブラック"
+            # 或 "スノーブラウン スノーミント"
+            # 把這些尺寸歸到每個顏色
+            # 先嘗試用換行分割
+            color_names = [c.strip() for c in re.split(r'\s+', color_text) if c.strip()]
+            # 過濾掉可能混入的非顏色文字（如 "上着", "パンツ", 數字等）
+            filtered = []
+            for cn in color_names:
+                # 跳過明顯不是顏色名的
+                if cn in ('上着', 'パンツ', '単位（cm）', '※', '胸囲', '着丈', '肩幅', '袖丈', '裄丈', 'ヒップ', 'ワタリ幅', '股下'):
+                    continue
+                # 顏色名通常是片假名/漢字/英文混合，長度 > 1
+                if len(cn) > 1:
+                    filtered.append(cn)
+
+            if not filtered:
+                # 解析不出顏色名，歸到 __all__
+                if '__all__' not in color_sizes:
+                    color_sizes['__all__'] = set()
+                for s in sizes_in_table:
+                    color_sizes['__all__'].add(s)
+            else:
+                for cn in filtered:
+                    if cn not in color_sizes:
+                        color_sizes[cn] = set()
+                    for s in sizes_in_table:
+                        color_sizes[cn].add(s)
+
+    # 轉換 set → list
+    if color_sizes:
+        return {k: sorted(list(v), key=lambda x: ['SS','XS','S','M','L','LL','XL','XXL','3L','4L','5L','7L','FREE'].index(x) if x in ['SS','XS','S','M','L','LL','XL','XXL','3L','4L','5L','7L','FREE'] else 99) for k, v in color_sizes.items()}
+
+    return None
+
+
 def parse_product_page(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=30)
@@ -287,12 +390,89 @@ def parse_product_page(url):
                             if s and s not in sizes: sizes.append(s)
         if not sizes: sizes = ['FREE']
 
+        # v2.3: 解析每個顏色對應的可用尺寸
+        color_sizes = parse_color_sizes_from_spec(soup)
+
         images = list(dict.fromkeys(images))[:10]
         if not images and manage_code: images.append(f"{SOURCE_URL}/img/goods/L/{manage_code}_t1.jpg")
         return {'url': url, 'title': title, 'price': price, 'manage_code': manage_code,
-                'description': description, 'size_spec': size_spec, 'colors': colors, 'sizes': sizes, 'images': images}
+                'description': description, 'size_spec': size_spec, 'colors': colors, 'sizes': sizes, 'images': images,
+                'color_sizes': color_sizes}
     except Exception as e:
         print(f"[ERROR] 解析失敗 {url}: {e}"); return None
+
+
+# ========== v2.3: variant 可用性判斷 ==========
+
+def get_available_variants(product_data):
+    """
+    v2.3: 根據 color_sizes 決定哪些 顏色+尺寸 組合應該建立
+    回傳: list of (color, size) tuples
+    如果 color_sizes 為 None（無法解析規格表），則回傳所有組合
+    """
+    colors = product_data['colors']
+    sizes = product_data['sizes']
+    color_sizes = product_data.get('color_sizes')
+
+    has_color = len(colors) > 1 or (len(colors) == 1 and colors[0] != '標準')
+    has_size = len(sizes) > 1 or (len(sizes) == 1 and sizes[0] != 'FREE')
+
+    if not color_sizes:
+        # 無法解析規格表 → 回傳所有組合
+        if has_color and has_size:
+            return [(c, s) for c in colors for s in sizes]
+        elif has_color:
+            return [(c, None) for c in colors]
+        elif has_size:
+            return [(None, s) for s in sizes]
+        else:
+            return [(None, None)]
+
+    available = []
+
+    if has_color and has_size:
+        for c in colors:
+            # 找出這個顏色對應的可用尺寸
+            available_sizes_for_color = None
+
+            # 精確匹配
+            if c in color_sizes:
+                available_sizes_for_color = color_sizes[c]
+            else:
+                # 模糊匹配：顏色名可能是子字串
+                for cs_key, cs_sizes in color_sizes.items():
+                    if cs_key == '__all__':
+                        continue
+                    if c in cs_key or cs_key in c:
+                        available_sizes_for_color = cs_sizes
+                        break
+
+            # 如果找不到特定顏色的尺寸，使用 __all__
+            if available_sizes_for_color is None and '__all__' in color_sizes:
+                available_sizes_for_color = color_sizes['__all__']
+
+            # 如果還是找不到，用所有尺寸（保守策略）
+            if available_sizes_for_color is None:
+                available_sizes_for_color = sizes
+
+            for s in sizes:
+                if s in available_sizes_for_color:
+                    available.append((c, s))
+
+    elif has_color:
+        # 只有顏色，沒有尺寸選項
+        for c in colors:
+            available.append((c, None))
+    elif has_size:
+        # 只有尺寸，沒有顏色選項
+        all_available = color_sizes.get('__all__', sizes)
+        for s in sizes:
+            if s in all_available:
+                available.append((None, s))
+    else:
+        available.append((None, None))
+
+    return available
 
 
 # ========== JSONL 生成 ==========
@@ -319,37 +499,48 @@ def product_to_jsonl_entry(product_data, tags, category_key, collection_id, exis
     images = product_data['images']; source_url = product_data['url']
     selling_price = calculate_selling_price(cost, DEFAULT_WEIGHT)
 
+    # v2.3: 只建立有貨的 variant 組合
+    available_variants = get_available_variants(product_data)
+    if not available_variants:
+        print(f"[跳過] 所有選項都缺貨: {mc}")
+        return None
+
+    # 從 available_variants 重新建立 colors/sizes 列表（只包含有貨的）
+    available_colors = sorted(set(c for c, s in available_variants if c is not None), key=lambda x: colors.index(x) if x in colors else 99)
+    available_sizes = sorted(set(s for c, s in available_variants if s is not None), key=lambda x: sizes.index(x) if x in sizes else 99)
+
+    has_color = bool(available_colors)
+    has_size = bool(available_sizes)
+
     product_options = []
-    has_color = len(colors) > 1 or (len(colors) == 1 and colors[0] != '標準')
-    has_size = len(sizes) > 1 or (len(sizes) == 1 and sizes[0] != 'FREE')
-    if has_color: product_options.append({"name": "顏色", "values": [{"name": c} for c in colors]})
-    if has_size: product_options.append({"name": "尺寸", "values": [{"name": s} for s in sizes]})
+    if has_color: product_options.append({"name": "顏色", "values": [{"name": c} for c in available_colors]})
+    if has_size: product_options.append({"name": "尺寸", "values": [{"name": s} for s in available_sizes]})
 
     image_list = images[:10]; first_image = image_list[0] if image_list else None
     files = [{"originalSource": u, "contentType": "IMAGE"} for u in image_list]
     vf = {"originalSource": first_image, "contentType": "IMAGE"} if first_image else None
 
     variants = []
-    if has_color and has_size:
-        for c in colors:
-            for s in sizes:
-                v = {"price": selling_price, "sku": f"{mc}-{c}-{s}", "inventoryPolicy": "CONTINUE", "taxable": False, "inventoryItem": {"cost": cost}, "optionValues": [{"optionName": "顏色", "name": c}, {"optionName": "尺寸", "name": s}]}
-                if vf: v["file"] = vf
-                variants.append(v)
-    elif has_color:
-        for c in colors:
-            v = {"price": selling_price, "sku": f"{mc}-{c}", "inventoryPolicy": "CONTINUE", "taxable": False, "inventoryItem": {"cost": cost}, "optionValues": [{"optionName": "顏色", "name": c}]}
-            if vf: v["file"] = vf
-            variants.append(v)
-    elif has_size:
-        for s in sizes:
-            v = {"price": selling_price, "sku": f"{mc}-{s}", "inventoryPolicy": "CONTINUE", "taxable": False, "inventoryItem": {"cost": cost}, "optionValues": [{"optionName": "尺寸", "name": s}]}
-            if vf: v["file"] = vf
-            variants.append(v)
-    else:
-        v = {"price": selling_price, "sku": mc, "inventoryPolicy": "CONTINUE", "taxable": False, "inventoryItem": {"cost": cost}}
-        if vf: v["file"] = vf
+    for color, size in available_variants:
+        sku_parts = [mc]
+        option_values = []
+        if color:
+            sku_parts.append(color)
+            option_values.append({"optionName": "顏色", "name": color})
+        if size:
+            sku_parts.append(size)
+            option_values.append({"optionName": "尺寸", "name": size})
+
+        v = {"price": selling_price, "sku": '-'.join(sku_parts), "inventoryPolicy": "CONTINUE", "taxable": False, "inventoryItem": {"cost": cost}}
+        if option_values:
+            v["optionValues"] = option_values
+        if vf:
+            v["file"] = vf
         variants.append(v)
+
+    total_combos = len(colors) * len(sizes) if len(colors) > 1 or colors[0] != '標準' else len(sizes)
+    if len(available_variants) < total_combos:
+        print(f"[v2.3] {mc}: 只建立 {len(available_variants)}/{total_combos} 個 variant（過濾缺貨選項）")
 
     pi = {"title": title, "descriptionHtml": description, "vendor": "WORKMAN", "productType": product_type,
         "status": "ACTIVE", "handle": f"workman-{mc}", "tags": tags,
@@ -488,6 +679,107 @@ def update_existing_product_price(product_id, product_data):
         time.sleep(0.1)
     return len(variants)
 
+
+# ========== v2.3: Variant 級別管理 ==========
+
+def get_product_variants_graphql(product_id):
+    """取得商品的所有 variants（GraphQL 版）"""
+    result = graphql_request(f'{{ product(id: "{product_id}") {{ variants(first: 100) {{ edges {{ node {{ id title selectedOptions {{ name value }} sku }} }} }} }} }}')
+    variants = []
+    for edge in result.get('data', {}).get('product', {}).get('variants', {}).get('edges', []):
+        n = edge['node']
+        opts = {o['name']: o['value'] for o in n.get('selectedOptions', [])}
+        variants.append({'id': n['id'], 'title': n.get('title', ''), 'sku': n.get('sku', ''), 'options': opts})
+    return variants
+
+def delete_variant_graphql(product_id, variant_id):
+    """刪除商品的某個 variant（GraphQL 版）"""
+    mutation = """mutation productVariantDelete($id: ID!) { productVariantDelete(id: $id) { deletedProductVariantId userErrors { field message } } }"""
+    result = graphql_request(mutation, {"id": variant_id})
+    errors = result.get('data', {}).get('productVariantDelete', {}).get('userErrors', [])
+    if errors:
+        print(f"[variant 刪除失敗] {variant_id}: {errors}")
+        return False
+    return True
+
+def sync_product_variants(product_id, product_title, available_variant_keys):
+    """
+    v2.3: 比對商品的 variants，刪除沒貨的顏色/尺寸組合
+    available_variant_keys: set of (color, size) 或 (color,) 或 (size,) 的 key 組合
+        例如: {('リミテッドブラック', 'M'), ('ライディングライムG', 'L'), ...}
+    回傳 {"kept": N, "deleted": N}
+    """
+    result = {"kept": 0, "deleted": 0}
+    variants = get_product_variants_graphql(product_id)
+
+    if not variants:
+        return result
+
+    if len(variants) <= 1:
+        # 只剩一個 variant 不能刪（Shopify 規定至少要有一個）
+        v = variants[0]
+        v_key = _variant_to_key(v)
+        if v_key not in available_variant_keys and available_variant_keys:
+            # 唯一的 variant 也沒貨 → 刪整個商品
+            print(f"[v2.3] 🗑 唯一選項也缺貨，刪除整個商品: {product_title[:30]}")
+            delete_product(product_id)
+            result["deleted"] = 1
+        else:
+            result["kept"] = 1
+        return result
+
+    for v in variants:
+        v_key = _variant_to_key(v)
+        if v_key in available_variant_keys or not available_variant_keys:
+            result["kept"] += 1
+        else:
+            # 這個 variant 沒貨 → 刪掉
+            if delete_variant_graphql(product_id, v['id']):
+                color_val = v['options'].get('顏色', '')
+                size_val = v['options'].get('尺寸', '')
+                print(f"    ❌ 刪除缺貨選項: {color_val} {size_val}")
+                result["deleted"] += 1
+            else:
+                result["kept"] += 1  # 刪失敗就保留
+        time.sleep(0.1)
+
+    # 刪完後如果沒有任何 variant 了，刪整個商品
+    if result["kept"] == 0:
+        remaining = get_product_variants_graphql(product_id)
+        if not remaining:
+            print(f"[v2.3] 🗑 所有選項都缺貨，刪除整個商品: {product_title[:30]}")
+            delete_product(product_id)
+
+    return result
+
+def _variant_to_key(variant):
+    """把 variant 的 options 轉成可比對的 key tuple"""
+    color = variant['options'].get('顏色', '')
+    size = variant['options'].get('尺寸', '')
+    if color and size:
+        return (color, size)
+    elif color:
+        return (color,)
+    elif size:
+        return (size,)
+    else:
+        return ('__default__',)
+
+def _available_variants_to_keys(available_variants):
+    """把 get_available_variants 的結果轉成 key set，用於比對"""
+    keys = set()
+    for color, size in available_variants:
+        if color and size:
+            keys.add((color, size))
+        elif color:
+            keys.add((color,))
+        elif size:
+            keys.add((size,))
+        else:
+            keys.add(('__default__',))
+    return keys
+
+
 def create_delete_jsonl(product_ids):
     jsonl_path = os.path.join(JSONL_DIR, f"delete_workman_{int(time.time())}.jsonl")
     with open(jsonl_path, 'w', encoding='utf-8') as f:
@@ -568,8 +860,72 @@ def check_workman_stock(product_url):
     except Exception as e:
         return {'available': True, 'page_exists': True, 'out_of_stock_reason': f'錯誤: {str(e)}（暫不處理）'}
 
+def check_workman_stock_with_variants(product_url):
+    """
+    v2.3: 一次爬取，同時檢查庫存 + 解析可用 variant
+    回傳: {'available': bool, 'page_exists': bool, 'out_of_stock_reason': str, 'available_variants': list or None}
+    """
+    result = {'available': True, 'page_exists': True, 'out_of_stock_reason': '', 'available_variants': None}
+    if not product_url:
+        return {'available': False, 'page_exists': False, 'out_of_stock_reason': '無來源連結', 'available_variants': None}
+    try:
+        r = requests.get(product_url, headers=HEADERS, timeout=30)
+        if r.status_code == 404:
+            return {'available': False, 'page_exists': False, 'out_of_stock_reason': '頁面已不存在 (404)', 'available_variants': None}
+        if r.status_code != 200:
+            return {'available': False, 'page_exists': False, 'out_of_stock_reason': f'HTTP {r.status_code}', 'available_variants': None}
+
+        soup = BeautifulSoup(r.text, 'html.parser')
+        pt = soup.get_text()
+
+        # --- 缺貨判斷（與 check_workman_stock 相同邏輯）---
+        for kw in OUT_OF_STOCK_KEYWORDS:
+            if kw in pt:
+                return {'available': False, 'page_exists': True, 'out_of_stock_reason': kw, 'available_variants': None}
+        if '売り切れ' in pt or '品切れ' in pt:
+            return {'available': False, 'page_exists': True, 'out_of_stock_reason': '売り切れ / 品切れ', 'available_variants': None}
+        if '予約受付は終了' in pt or '受付終了' in pt:
+            return {'available': False, 'page_exists': True, 'out_of_stock_reason': '予約受付終了', 'available_variants': None}
+
+        # --- 有貨：用同一個 soup 解析 variant ---
+        colors = []
+        gallery = soup.find('ul', class_='js-goods-detail-gallery-slider')
+        if gallery:
+            for item in gallery.find_all('li', class_='block-goods-gallery--color-variation-src'):
+                ce = item.find('p', class_='block-goods-detail--color-variation-goods-color-name')
+                if ce:
+                    c = ce.get_text(strip=True)
+                    if c and c not in colors: colors.append(c)
+        if not colors: colors = ['標準']
+
+        sizes = []
+        sd = soup.find('dt', string='サイズ・スペック')
+        if sd:
+            sdd = sd.find_next_sibling('dd')
+            if sdd:
+                table = sdd.find('table')
+                if table:
+                    fr = table.find('tr')
+                    if fr:
+                        for th in fr.find_all('th')[1:]:
+                            s = th.get_text(strip=True)
+                            if s and s not in sizes: sizes.append(s)
+        if not sizes: sizes = ['FREE']
+
+        color_sizes = parse_color_sizes_from_spec(soup)
+        product_data = {'colors': colors, 'sizes': sizes, 'color_sizes': color_sizes}
+        result['available_variants'] = get_available_variants(product_data)
+        return result
+
+    except requests.exceptions.Timeout:
+        return {'available': True, 'page_exists': True, 'out_of_stock_reason': '連線超時（暫不處理）', 'available_variants': None}
+    except Exception as e:
+        print(f"[v2.3] 檢查失敗 {product_url}: {e}")
+        return {'available': True, 'page_exists': True, 'out_of_stock_reason': f'錯誤: {str(e)}（暫不處理）', 'available_variants': None}
+
+
 def run_inventory_sync():
-    """v2.2: 庫存同步 — 缺貨商品直接刪除"""
+    """v2.3: 庫存同步 — 缺貨商品刪除 + 缺貨 variant 刪除"""
     global inventory_sync_status
     reset_inventory_sync_status()
     inventory_sync_status['running'] = True; inventory_sync_status['phase'] = 'fetching'
@@ -589,22 +945,34 @@ def run_inventory_sync():
                 m = re.search(r'workman-(\d+)', product.get('handle', ''))
                 if m: su = f"{SOURCE_URL}/shop/g/g{m.group(1)}/"
                 else: inventory_sync_status['results']['checked'] += 1; inventory_sync_status['results']['errors'] += 1; continue
-            stock = check_workman_stock(su)
+
+            # v2.3: 檢查庫存 + variant 可用性
+            stock = check_workman_stock_with_variants(su)
             inventory_sync_status['results']['checked'] += 1
+
             if stock['available']:
                 inventory_sync_status['results']['in_stock'] += 1
+
+                # v2.3: 比對 variant
+                if stock.get('available_variants') is not None:
+                    available_keys = _available_variants_to_keys(stock['available_variants'])
+                    vr = sync_product_variants(product['id'], product['title'], available_keys)
+                    if vr['deleted'] > 0:
+                        inventory_sync_status['results']['variants_deleted'] += vr['deleted']
+                        print(f"[v2.3] 👕 {product['title'][:30]}: 保留 {vr['kept']} 選項, 刪除 {vr['deleted']} 選項")
+
                 inventory_sync_status['details'].append({'title': product['title'][:40], 'status': 'in_stock', 'source_url': su})
             else:
                 inventory_sync_status['results']['out_of_stock'] += 1
                 if not stock['page_exists']: inventory_sync_status['results']['page_gone'] += 1
-                # v2.2: 直接刪除（不設草稿）
+                # 整個商品缺貨 → 刪除
                 if delete_product(product['id']):
                     inventory_sync_status['results']['deleted'] += 1
                 inventory_sync_status['details'].append({'title': product['title'][:40], 'status': 'out_of_stock', 'reason': stock['out_of_stock_reason'], 'source_url': su})
             time.sleep(1)
         inventory_sync_status['phase'] = 'completed'
         r = inventory_sync_status['results']
-        inventory_sync_status['current_product'] = f"✅ 完成！檢查:{r['checked']} 有貨:{r['in_stock']} 缺貨:{r['out_of_stock']} 已刪除:{r['deleted']}"
+        inventory_sync_status['current_product'] = f"✅ 完成！檢查:{r['checked']} 有貨:{r['in_stock']} 缺貨:{r['out_of_stock']} 已刪除商品:{r['deleted']} 已刪除選項:{r['variants_deleted']}"
     except Exception as e:
         inventory_sync_status['errors'].append({'error': str(e)})
         inventory_sync_status['phase'] = 'error'
@@ -626,6 +994,7 @@ def run_test_single():
         product_data = parse_product_page(product_links[0])
         if not product_data: scrape_status['errors'].append({'error': '解析商品失敗'}); return
         entry = product_to_jsonl_entry(product_data, cat_info['tags'], cat_key, collection_id)
+        if not entry: scrape_status['errors'].append({'error': '所有選項都缺貨'}); return
         pi = entry['productSet']
         scrape_status['products'].append({'title': pi['title'], 'handle': pi['handle'], 'variants': len(pi.get('variants', []))})
         mutation = """mutation productSet($input: ProductSetInput!, $synchronous: Boolean!) { productSet(synchronous: $synchronous, input: $input) { product { id title handle status productType seo { title description } variants(first: 10) { edges { node { id sku price taxable inventoryItem { unitCost { amount currencyCode } } } } } } userErrors { field code message } } }"""
@@ -663,8 +1032,11 @@ def run_scrape(category):
                 if not pd: scrape_status['errors'].append({'url': link, 'error': '解析失敗'}); continue
                 try:
                     entry = product_to_jsonl_entry(pd, ci['tags'], ck, cid)
-                    all_entries.append(entry)
-                    scrape_status['products'].append({'title': entry['productSet']['title'], 'handle': entry['productSet']['handle'], 'variants': len(entry['productSet'].get('variants', []))})
+                    if entry:
+                        all_entries.append(entry)
+                        scrape_status['products'].append({'title': entry['productSet']['title'], 'handle': entry['productSet']['handle'], 'variants': len(entry['productSet'].get('variants', []))})
+                    else:
+                        scrape_status['errors'].append({'url': link, 'error': '所有選項缺貨，跳過'})
                 except Exception as e: scrape_status['errors'].append({'url': link, 'error': str(e)})
                 time.sleep(0.5)
         if all_entries:
@@ -694,10 +1066,10 @@ def run_bulk_upload(jsonl_path):
 
 
 def run_full_sync(category='all'):
-    """v2.2 智慧同步：新商品→上架 / 已存在+有貨→更新價格 / 缺貨/下架→刪除"""
+    """v2.3 智慧同步：新商品→只建有貨variant / 已存在+有貨→更新價格+刪缺貨variant / 缺貨/下架→刪除"""
     global scrape_status
     scrape_status = {"running": True, "phase": "cron_sync", "progress": 0, "total": 0, "current_product": "開始智慧同步...",
-        "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "deleted": 0}
+        "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "deleted": 0, "variants_deleted": 0}
     try:
         cats = ['work', 'mens', 'womens', 'kids'] if category == 'all' else [category] if category in CATEGORIES else []
         if not cats: raise Exception(f'未知分類: {category}')
@@ -707,7 +1079,7 @@ def run_full_sync(category='all'):
         existing_handles = {p['handle']: p for p in existing_products}
 
         new_entries = []; scraped_handles = set()
-        updated_count = 0; price_updated_count = 0
+        updated_count = 0; price_updated_count = 0; variants_deleted_count = 0
 
         for ck in cats:
             ci = CATEGORIES[ck]; cid = get_or_create_collection(ci['collection'])
@@ -727,7 +1099,8 @@ def run_full_sync(category='all'):
 
                 if ei:
                     scraped_handles.add(mh)
-                    stock = check_workman_stock(link)
+                    # v2.3: 使用 check_workman_stock_with_variants
+                    stock = check_workman_stock_with_variants(link)
                     if stock['available']:
                         try:
                             r = requests.get(link, headers=HEADERS, timeout=30)
@@ -745,22 +1118,35 @@ def run_full_sync(category='all'):
                                 if pids:
                                     graphql_request("""mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) { publishablePublish(id: $id, input: $input) { userErrors { field message } } }""",
                                         {"id": ei['id'], "input": [{"publicationId": p} for p in pids]})
+
+                            # v2.3: 比對 variant，刪除缺貨選項
+                            if stock.get('available_variants') is not None:
+                                available_keys = _available_variants_to_keys(stock['available_variants'])
+                                vr = sync_product_variants(ei['id'], ei['title'], available_keys)
+                                variants_deleted_count += vr['deleted']
+                                if vr['deleted'] > 0:
+                                    print(f"[SYNC v2.3] 👕 {ei['title'][:30]}: 保留 {vr['kept']}, 刪除 {vr['deleted']} 選項")
+
                             updated_count += 1
                         except Exception as e: scrape_status['errors'].append({'url': link, 'error': f'更新失敗: {str(e)}'})
                     else:
-                        # v2.2: 缺貨 → 直接刪除
+                        # 缺貨 → 直接刪除
                         print(f"[SYNC] 🗑 缺貨刪除: {ei['title'][:30]} ({stock['out_of_stock_reason']})")
                         if delete_product(ei['id']):
                             scrape_status['deleted'] = scrape_status.get('deleted', 0) + 1
                     time.sleep(0.3)
                 else:
+                    # 新商品 — v2.3: 只建立有貨的 variant
                     pd = parse_product_page(link)
                     if not pd: continue
                     if mc: scraped_handles.add(f"workman-{pd['manage_code']}")
                     try:
                         entry = product_to_jsonl_entry(pd, ci['tags'], ck, cid)
-                        new_entries.append(entry)
-                        scrape_status['products'].append({'title': entry['productSet']['title'], 'handle': entry['productSet']['handle'], 'variants': len(entry['productSet'].get('variants', []))})
+                        if entry:
+                            new_entries.append(entry)
+                            scrape_status['products'].append({'title': entry['productSet']['title'], 'handle': entry['productSet']['handle'], 'variants': len(entry['productSet'].get('variants', []))})
+                        else:
+                            print(f"[SYNC v2.3] ⏭ 所有選項缺貨，跳過: {pd['manage_code']}")
                     except Exception as e: scrape_status['errors'].append({'url': link, 'error': str(e)})
                     time.sleep(0.5)
 
@@ -789,7 +1175,7 @@ def run_full_sync(category='all'):
             scrape_status['phase'] = 'publishing'; scrape_status['current_product'] = '發布新商品...'
             batch_publish_workman_products()
 
-        # === v2.2: 下架商品直接刪除 ===
+        # 下架商品直接刪除
         scrape_status['phase'] = 'deleting'
         scrape_status['current_product'] = '清理下架商品...'
         delete_count = scrape_status.get('deleted', 0)
@@ -802,9 +1188,10 @@ def run_full_sync(category='all'):
                 time.sleep(0.2)
 
         scrape_status['deleted'] = delete_count
-        scrape_status['current_product'] = f"✅ 完成！新商品 {len(new_entries)} 個，更新 {updated_count} 個，刪除 {delete_count} 個"
+        scrape_status['variants_deleted'] = variants_deleted_count
+        scrape_status['current_product'] = f"✅ 完成！新商品 {len(new_entries)} 個，更新 {updated_count} 個，刪除商品 {delete_count} 個，刪除選項 {variants_deleted_count} 個"
         scrape_status['phase'] = 'completed'
-        return {'success': True, 'new_products': len(new_entries), 'updated': updated_count, 'deleted': delete_count}
+        return {'success': True, 'new_products': len(new_entries), 'updated': updated_count, 'deleted': delete_count, 'variants_deleted': variants_deleted_count}
     except Exception as e:
         scrape_status['errors'].append({'error': str(e)}); scrape_status['phase'] = 'error'
         return {'success': False, 'error': str(e)}
@@ -950,6 +1337,10 @@ def api_test_product():
             if cd:
                 dd = cd.find_next_sibling('dd')
                 if dd: results['manage_code'] = dd.get_text(strip=True)
+            # v2.3: 測試 color_sizes 解析
+            color_sizes = parse_color_sizes_from_spec(soup)
+            if color_sizes:
+                results['color_sizes'] = {k: list(v) if isinstance(v, set) else v for k, v in color_sizes.items()}
     except Exception as e: results['error'] = str(e)
     return jsonify(results)
 
@@ -968,9 +1359,14 @@ def api_check_stock():
     from flask import request
     url = request.args.get('url', '')
     if not url: return jsonify({'error': '請提供 url 參數'})
-    return jsonify(check_workman_stock(url))
+    # v2.3: 回傳包含 variant 資訊的庫存檢查
+    result = check_workman_stock_with_variants(url)
+    # 把 available_variants 轉成可序列化的格式
+    if result.get('available_variants'):
+        result['available_variants'] = [(c, s) for c, s in result['available_variants']]
+    return jsonify(result)
 
 
 if __name__ == '__main__':
-    print("WORKMAN 爬蟲工具 v2.2")
+    print("WORKMAN 爬蟲工具 v2.3")
     app.run(host='0.0.0.0', port=8080, debug=True)

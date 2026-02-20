@@ -1,5 +1,5 @@
 """
-BAPE 商品爬蟲 + Shopify Bulk Operations 上架工具 v2.2
+BAPE 商品爬蟲 + Shopify Bulk Operations 上架工具 v2.3
 來源：jp.bape.com
 功能：
 1. 按分類爬取 jp.bape.com 商品（メンズ、レディース、キッズ）
@@ -7,6 +7,7 @@ BAPE 商品爬蟲 + Shopify Bulk Operations 上架工具 v2.2
 3. 使用 Shopify Bulk Operations API 批量上傳
 4. 智慧同步：新商品上架、已存在只更新價格
 5. v2.2: 下架/缺貨商品直接刪除（不設草稿）
+6. v2.3: variant 級別庫存同步 - 自動刪除缺貨選項，新商品只建立有貨選項
 """
 
 from flask import Flask, jsonify, request
@@ -50,7 +51,7 @@ scrape_status = {
     "running": False, "phase": "", "progress": 0, "total": 0,
     "current_product": "", "products": [], "errors": [],
     "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "",
-    "deleted": 0,
+    "deleted": 0, "variants_deleted": 0,
 }
 
 
@@ -271,7 +272,7 @@ def product_to_jsonl_entry(product, category_key, collection_id, existing_produc
     files = [{"originalSource": u, "contentType": "IMAGE"} for u in image_list]
     variants = []
     for sv in source_variants:
-        if not sv.get('available', False): continue
+        if not sv.get('available', False): continue  # v2.3: 只建立有貨的 variant
         cost = float(sv.get('price', 0))
         if cost < MIN_PRICE: continue
         weight = float(sv.get('grams', 0)) / 1000 if sv.get('grams') else DEFAULT_WEIGHT
@@ -290,7 +291,7 @@ def product_to_jsonl_entry(product, category_key, collection_id, existing_produc
             variant["file"] = {"originalSource": image_id_to_url[variant_image_id], "contentType": "IMAGE"}
         elif first_image: variant["file"] = {"originalSource": first_image, "contentType": "IMAGE"}
         variants.append(variant)
-    if not variants: return None
+    if not variants: return None  # v2.3: 全部缺貨 → 不上架
     product_input = {
         "title": trans_title, "descriptionHtml": trans_desc, "vendor": "BAPE",
         "productType": cat_info['product_type'], "status": "ACTIVE", "handle": f"bape-{handle}",
@@ -418,12 +419,94 @@ def batch_publish_bape_products():
     return results
 
 
+# ========== v2.3: Variant 級別庫存同步 ==========
+
+def get_product_variants_graphql(product_id):
+    """取得商品所有 variants（GraphQL）"""
+    query = f"""{{ product(id: "{product_id}") {{ variants(first: 100) {{ edges {{ node {{ id title sku selectedOptions {{ name value }} }} }} }} }} }}"""
+    result = graphql_request(query)
+    variants = []
+    for edge in result.get('data', {}).get('product', {}).get('variants', {}).get('edges', []):
+        node = edge['node']
+        variants.append({
+            'id': node['id'],
+            'title': node.get('title', ''),
+            'sku': node.get('sku', ''),
+            'options': {opt['name']: opt['value'] for opt in node.get('selectedOptions', [])}
+        })
+    return variants
+
+
+def delete_variant_graphql(product_id, variant_id):
+    """刪除單一 variant"""
+    mutation = """mutation productVariantsBulkDelete($productId: ID!, $variantsIds: [ID!]!) {
+        productVariantsBulkDelete(productId: $productId, variantsIds: $variantsIds) {
+            product { id title }
+            userErrors { field message }
+        }
+    }"""
+    result = graphql_request(mutation, {"productId": product_id, "variantsIds": [variant_id]})
+    errors = result.get('data', {}).get('productVariantsBulkDelete', {}).get('userErrors', [])
+    if errors:
+        print(f"[v2.3] 刪除 variant 失敗: {errors}")
+        return False
+    return True
+
+
+def sync_bape_variants(product_id, product_title, source_variants, options):
+    """
+    v2.3: 比對 Shopify variants vs BAPE source variants，刪除缺貨的
+    source_variants: BAPE API 回傳的 variants list（含 available 欄位）
+    options: BAPE API 回傳的 options list
+    回傳: {'kept': N, 'deleted': N, 'product_deleted': bool}
+    """
+    shopify_variants = get_product_variants_graphql(product_id)
+    if not shopify_variants:
+        return {'kept': 0, 'deleted': 0, 'product_deleted': False}
+
+    # 建立 source 有貨 variant 的 key set
+    # BAPE variant title 格式: "option1 / option2" 或 "Default Title"
+    available_keys = set()
+    for sv in source_variants:
+        if not sv.get('available', False):
+            continue
+        parts = []
+        if sv.get('option1') and len(options) > 0 and options[0].get('name') != 'Title':
+            parts.append(sv['option1'])
+        if sv.get('option2') and len(options) > 1:
+            parts.append(sv['option2'])
+        if sv.get('option3') and len(options) > 2:
+            parts.append(sv['option3'])
+        key = ' / '.join(parts) if parts else 'Default Title'
+        available_keys.add(key)
+
+    kept = 0; deleted = 0
+    for sv in shopify_variants:
+        variant_key = sv['title']
+        if variant_key in available_keys:
+            kept += 1
+        else:
+            # 只剩最後一個 variant → 刪整個商品
+            if len(shopify_variants) - deleted <= 1:
+                print(f"[v2.3] 🗑 商品所有 variant 都缺貨，刪除整個商品: {product_title[:30]}")
+                delete_product(product_id)
+                return {'kept': 0, 'deleted': deleted + 1, 'product_deleted': True}
+            print(f"[v2.3] 🗑 刪除缺貨 variant: {product_title[:25]} - {variant_key}")
+            if delete_variant_graphql(product_id, sv['id']):
+                deleted += 1
+            time.sleep(0.2)
+
+    if deleted > 0:
+        print(f"[v2.3] {product_title[:25]}: 保留 {kept}, 刪除 {deleted}")
+    return {'kept': kept, 'deleted': deleted, 'product_deleted': False}
+
+
 # ========== 主流程 ==========
 
 def run_test_single(category='mens'):
     global scrape_status
     scrape_status = {"running": True, "phase": "testing", "progress": 0, "total": 1, "current_product": "測試單品...",
-        "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "deleted": 0}
+        "products": [], "errors": [], "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "deleted": 0, "variants_deleted": 0}
     try:
         cat_info = CATEGORIES[category]
         collection_id = get_or_create_collection(cat_info['collection'])
@@ -442,7 +525,7 @@ def run_test_single(category='mens'):
         scrape_status['current_product'] = f"翻譯: {test_product['title'][:30]}..."
         entry = product_to_jsonl_entry(test_product, category, collection_id)
         if not entry:
-            scrape_status['errors'].append({'error': '商品轉換失敗'}); return
+            scrape_status['errors'].append({'error': '商品轉換失敗（全部 variant 缺貨）'}); return
         product_input = entry['productSet']
         scrape_status['products'].append({'title': product_input['title'], 'handle': product_input['handle'], 'variants': len(product_input.get('variants', []))})
         scrape_status['current_product'] = "上傳到 Shopify..."
@@ -467,12 +550,12 @@ def run_test_single(category='mens'):
 
 
 def run_full_sync(category='all'):
-    """v2.2 智慧同步：新商品→Bulk Upload / 已存在→更新價格 / 下架/缺貨→刪除"""
+    """v2.3 智慧同步：新商品→Bulk Upload / 已存在→更新價格+同步variant / 下架/缺貨→刪除"""
     global scrape_status
-    print(f"[SYNC] ========== 開始智慧同步 v2.2 ==========")
+    print(f"[SYNC] ========== 開始智慧同步 v2.3 ==========")
     scrape_status = {"running": True, "phase": "cron_sync", "progress": 0, "total": 0,
         "current_product": "開始智慧同步...", "products": [], "errors": [],
-        "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "deleted": 0}
+        "jsonl_file": "", "bulk_operation_id": "", "bulk_status": "", "deleted": 0, "variants_deleted": 0}
     try:
         categories_to_scrape = ['mens', 'womens', 'kids'] if category == 'all' else [category] if category in CATEGORIES else []
         if not categories_to_scrape: raise Exception(f'未知分類: {category}')
@@ -489,7 +572,7 @@ def run_full_sync(category='all'):
 
         # 3. 比對 + 處理
         new_entries = []; scraped_handles = set()
-        updated_count = 0; price_updated_count = 0
+        updated_count = 0; price_updated_count = 0; total_variants_deleted = 0
 
         for cat_key in categories_to_scrape:
             cat_info = CATEGORIES[cat_key]
@@ -508,8 +591,21 @@ def run_full_sync(category='all'):
 
                 if existing_info:
                     try:
+                        # 更新價格
                         cnt = update_existing_product_price(existing_info['id'], product.get('variants', []))
                         if cnt > 0: price_updated_count += 1
+
+                        # v2.3: 同步 variant（刪除缺貨選項）
+                        sync_result = sync_bape_variants(
+                            existing_info['id'],
+                            existing_info.get('title', title),
+                            product.get('variants', []),
+                            product.get('options', [])
+                        )
+                        total_variants_deleted += sync_result.get('deleted', 0)
+                        if sync_result.get('product_deleted'):
+                            scrape_status['deleted'] = scrape_status.get('deleted', 0) + 1
+
                         if existing_info.get('status') == 'DRAFT':
                             set_product_active(existing_info['id'])
                             pub_ids = get_all_publication_ids()
@@ -569,11 +665,12 @@ def run_full_sync(category='all'):
                     delete_count += 1
                 time.sleep(0.2)
 
-        scrape_status['deleted'] = delete_count
-        scrape_status['current_product'] = f"✅ 完成！新商品 {len(new_entries)} 個，更新 {updated_count} 個，刪除 {delete_count} 個"
+        scrape_status['deleted'] = scrape_status.get('deleted', 0) + delete_count
+        scrape_status['variants_deleted'] = total_variants_deleted
+        scrape_status['current_product'] = f"✅ 完成！新商品 {len(new_entries)} 個，更新 {updated_count} 個，刪除商品 {scrape_status['deleted']} 個，刪除選項 {total_variants_deleted} 個"
         scrape_status['phase'] = 'completed'
-        print(f"[SYNC] ✅ 新商品: {len(new_entries)}, 更新價格: {price_updated_count}, 刪除: {delete_count}")
-        return {'success': True, 'new_products': len(new_entries), 'updated': updated_count, 'deleted': delete_count}
+        print(f"[SYNC] ✅ 新商品: {len(new_entries)}, 更新價格: {price_updated_count}, 刪除商品: {scrape_status['deleted']}, 刪除選項: {total_variants_deleted}")
+        return {'success': True, 'new_products': len(new_entries), 'updated': updated_count, 'deleted': scrape_status['deleted'], 'variants_deleted': total_variants_deleted}
 
     except Exception as e:
         scrape_status['errors'].append({'error': str(e)})
@@ -592,14 +689,14 @@ def index():
     return '''<!DOCTYPE html>
 <html lang="zh-TW">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>BAPE 爬蟲工具</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f5f5;padding:20px}.container{max-width:1000px;margin:0 auto}h1{color:#333;margin-bottom:20px}.card{background:white;border-radius:12px;padding:20px;margin-bottom:20px;box-shadow:0 2px 8px rgba(0,0,0,0.1)}.card h2{color:#444;margin-bottom:15px;font-size:18px}.btn{display:inline-block;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;margin:5px}.btn-primary{background:#0066ff;color:white}.btn-success{background:#00c853;color:white}.btn-warning{background:#ff9800;color:white}.btn-danger{background:#f44336;color:white}.btn:disabled{opacity:0.5;cursor:not-allowed}.status{background:#f8f9fa;border-radius:8px;padding:15px;margin-top:15px}.progress-bar{height:20px;background:#e0e0e0;border-radius:10px;overflow:hidden;margin:10px 0}.progress-fill{height:100%;background:linear-gradient(90deg,#0066ff,#00c853);transition:width 0.3s}.log{background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:8px;max-height:300px;overflow-y:auto;font-family:monospace;font-size:12px}select{padding:10px;border-radius:6px;border:1px solid #ddd;font-size:14px;margin-right:10px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:15px;margin-top:15px}.stat-box{background:#f0f4f8;padding:15px;border-radius:8px;text-align:center}.stat-value{font-size:24px;font-weight:bold}.stat-label{font-size:12px;color:#666}.danger-zone{border:2px solid #f44336;background:#fff5f5}</style></head>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f5f5;padding:20px}.container{max-width:1000px;margin:0 auto}h1{color:#333;margin-bottom:20px}.card{background:white;border-radius:12px;padding:20px;margin-bottom:20px;box-shadow:0 2px 8px rgba(0,0,0,0.1)}.card h2{color:#444;margin-bottom:15px;font-size:18px}.btn{display:inline-block;padding:12px 24px;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;margin:5px}.btn-primary{background:#0066ff;color:white}.btn-success{background:#00c853;color:white}.btn-warning{background:#ff9800;color:white}.btn-danger{background:#f44336;color:white}.btn:disabled{opacity:0.5;cursor:not-allowed}.status{background:#f8f9fa;border-radius:8px;padding:15px;margin-top:15px}.progress-bar{height:20px;background:#e0e0e0;border-radius:10px;overflow:hidden;margin:10px 0}.progress-fill{height:100%;background:linear-gradient(90deg,#0066ff,#00c853);transition:width 0.3s}.log{background:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:8px;max-height:300px;overflow-y:auto;font-family:monospace;font-size:12px}select{padding:10px;border-radius:6px;border:1px solid #ddd;font-size:14px;margin-right:10px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-top:15px}.stat-box{background:#f0f4f8;padding:15px;border-radius:8px;text-align:center}.stat-value{font-size:24px;font-weight:bold}.stat-label{font-size:12px;color:#666}.danger-zone{border:2px solid #f44336;background:#fff5f5}</style></head>
 <body><div class="container">
-<h1>🦍 BAPE 爬蟲工具 <small style="font-size:14px;color:#999">v2.2</small></h1>
+<h1>🦍 BAPE 爬蟲工具 <small style="font-size:14px;color:#999">v2.3</small></h1>
 <div class="card"><h2>⚡ 測試單品</h2>
 <select id="testCat"><option value="mens">男裝</option><option value="womens">女裝</option><option value="kids">童裝</option></select>
 <button class="btn btn-warning" onclick="startTest()">🧪 測試單品</button></div>
 <div class="card"><h2>🔄 智慧同步</h2>
-<p style="color:#666;margin-bottom:10px;">新商品→翻譯上架 / 已存在→更新價格 / <b style="color:#e67e22">下架/缺貨→自動刪除</b></p>
+<p style="color:#666;margin-bottom:10px;">新商品→翻譯上架（只建有貨選項） / 已存在→更新價格+<b style="color:#9b59b6">刪缺貨選項</b> / <b style="color:#e67e22">下架→刪除商品</b></p>
 <select id="syncCat"><option value="all">全部</option><option value="mens">男裝</option><option value="womens">女裝</option><option value="kids">童裝</option></select>
 <button class="btn btn-success" onclick="startSync()">🔄 開始同步</button></div>
 <div class="card"><h2>📊 執行狀態</h2>
@@ -607,7 +704,8 @@ def index():
 <div class="status"><div>階段：<span id="phase">-</span></div><div>進度：<span id="progress">0/0</span></div><div>目前：<span id="current">-</span></div></div>
 <div class="stats">
 <div class="stat-box"><div class="stat-value" id="productCount">0</div><div class="stat-label">新商品</div></div>
-<div class="stat-box"><div class="stat-value" id="deletedCount" style="color:#e67e22">0</div><div class="stat-label">已刪除</div></div>
+<div class="stat-box"><div class="stat-value" id="deletedCount" style="color:#e67e22">0</div><div class="stat-label">已刪除商品</div></div>
+<div class="stat-box"><div class="stat-value" id="variantsDeletedCount" style="color:#9b59b6">0</div><div class="stat-label">已刪除選項</div></div>
 <div class="stat-box"><div class="stat-value" id="errorCount" style="color:#e74c3c">0</div><div class="stat-label">錯誤</div></div>
 </div></div>
 <div class="card"><h2>📝 日誌</h2><div class="log" id="log"></div></div>
@@ -622,7 +720,7 @@ def index():
 <script>
 let pollInterval;
 function log(msg,type='info'){const d=document.getElementById('log');const t=new Date().toLocaleTimeString();const c=type==='success'?'#4ec9b0':type==='error'?'#f14c4c':'#d4d4d4';d.innerHTML+=`<div style="color:${c}">[${t}] ${msg}</div>`;d.scrollTop=d.scrollHeight}
-function updateStatus(d){document.getElementById('phase').textContent=d.phase||'-';document.getElementById('progress').textContent=`${d.progress||0}/${d.total||0}`;document.getElementById('current').textContent=d.current_product||'-';document.getElementById('productCount').textContent=d.products?.length||0;document.getElementById('deletedCount').textContent=d.deleted||0;document.getElementById('errorCount').textContent=d.errors?.length||0;document.getElementById('progressFill').style.width=d.total>0?(d.progress/d.total*100)+'%':'0%'}
+function updateStatus(d){document.getElementById('phase').textContent=d.phase||'-';document.getElementById('progress').textContent=`${d.progress||0}/${d.total||0}`;document.getElementById('current').textContent=d.current_product||'-';document.getElementById('productCount').textContent=d.products?.length||0;document.getElementById('deletedCount').textContent=d.deleted||0;document.getElementById('variantsDeletedCount').textContent=d.variants_deleted||0;document.getElementById('errorCount').textContent=d.errors?.length||0;document.getElementById('progressFill').style.width=d.total>0?(d.progress/d.total*100)+'%':'0%'}
 async function pollStatus(){try{const r=await fetch('/api/status');const d=await r.json();updateStatus(d);if(!d.running){clearInterval(pollInterval);if(d.phase==='completed')log('✅ 完成！','success');if(d.errors?.length>0)d.errors.forEach(e=>log('❌ '+(e.error||JSON.stringify(e)),'error'))}}catch(e){}}
 async function startTest(){log('🧪 開始測試單品...');const r=await fetch('/api/test_single?category='+document.getElementById('testCat').value);const d=await r.json();if(d.success){log('測試已啟動','success');pollInterval=setInterval(pollStatus,1000)}else log('❌ '+(d.error||'啟動失敗'),'error')}
 async function startSync(){log('🔄 開始智慧同步...');const r=await fetch('/api/auto_sync?category='+document.getElementById('syncCat').value);const d=await r.json();if(d.success){log('同步已啟動','success');pollInterval=setInterval(pollStatus,1000)}else log('❌ '+(d.error||'啟動失敗'),'error')}
@@ -717,5 +815,5 @@ def api_test_bape():
 
 
 if __name__ == '__main__':
-    print("BAPE 爬蟲工具 v2.2")
+    print("BAPE 爬蟲工具 v2.3")
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)

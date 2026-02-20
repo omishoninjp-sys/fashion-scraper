@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>WORKMAN 爬蟲 (Bulk Operations)</title>
+    <title>WORKMAN 爬蟲 v2.2</title>
     <style>
         * { box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
@@ -35,32 +35,32 @@
     </style>
 </head>
 <body>
-    <h1>🏭 WORKMAN 爬蟲 (Bulk Operations 版)</h1>
-    
+    <h1>🏭 WORKMAN 爬蟲 v2.2 <small style="color:#e67e22;font-size:14px;">缺貨自動刪除</small></h1>
+
     <div class="card" style="border: 2px solid #ff9800; background: #fff8e1;">
         <h3>🔄 庫存同步</h3>
-        <p>檢查 WORKMAN 官網庫存狀態，自動將缺貨商品設為草稿並庫存歸零。</p>
-        <p style="font-size:13px;color:#666;">判斷條件：「店舗のみのお取り扱い」「オンラインストア販売終了」「店舗在庫を確認する」「売り切れ」「品切れ」「頁面 404」</p>
+        <p>檢查 WORKMAN 官網庫存狀態，<b style="color:#e67e22">缺貨商品自動刪除</b>。</p>
+        <p style="font-size:13px;color:#666;">判斷條件：「店舗のみのお取り扱い」「オンラインストア販売終了」「店舗在庫を確認する」「売り切れ」「品切れ」「予約受付終了」「頁面 404」</p>
         <button class="btn" style="background:#ff9800;color:white;font-size:18px;padding:15px 30px;" onclick="startInventorySync()">🔄 開始庫存同步</button>
         <button class="btn btn-check" onclick="checkInventorySyncStatus()">📊 查看同步狀態</button>
         <button class="btn btn-check" onclick="checkSingleStock()">🔍 檢查單一商品</button>
         <div id="syncResult" style="margin-top:10px;padding:10px;background:#fff;border-radius:5px;display:none;"></div>
     </div>
-    
+
     <div class="card">
         <h3>🔗 連線測試</h3>
         <button class="btn btn-check" onclick="testConnection()">🔗 測試 workman.jp</button>
         <button class="btn btn-check" onclick="testProductParse()">🔍 測試商品解析</button>
         <button class="btn btn-check" onclick="testShopify()">🔗 測試 Shopify</button>
     </div>
-    
+
     <div class="card" style="border: 2px solid #28a745; background: #f0fff4;">
         <h3>🧪 測試單品（快速驗證）</h3>
         <button class="btn" style="background:#28a745;color:white;" onclick="testSingle()">🧪 測試單品上傳</button>
         <button class="btn btn-check" onclick="checkTestResult()">📋 查看測試結果</button>
         <div id="testResult" style="margin-top:10px;padding:10px;background:#fff;border-radius:5px;display:none;"></div>
     </div>
-    
+
     <div class="card">
         <h3>📥 第一步：爬取商品 → 產生 JSONL</h3>
         <button class="btn btn-work" onclick="startScrape('work')">🔧 作業服</button>
@@ -69,7 +69,7 @@
         <button class="btn btn-kids" onclick="startScrape('kids')">👶 兒童服</button>
         <button class="btn btn-all" onclick="startScrape('all')">🚀 全部</button>
     </div>
-    
+
     <div class="card">
         <h3>📤 第二步：批量上傳到 Shopify</h3>
         <div style="margin:10px 0;padding:10px;background:#e8f5e9;border-radius:8px;">
@@ -79,36 +79,35 @@
         <button class="btn btn-check" onclick="checkStatus()">🔍 檢查上傳狀態</button>
         <button class="btn btn-check" onclick="checkResults()">📋 查看詳細結果</button>
     </div>
-    
+
     <div class="card">
         <h3>🗑️ 批量刪除</h3>
         <div class="warning-box">⚠️ 會刪除所有 WORKMAN 商品！</div>
         <button class="btn btn-delete" onclick="startDelete()">🗑️ 刪除全部</button>
         <button class="btn btn-check" onclick="countProducts()">📊 查詢數量</button>
     </div>
-    
+
     <div class="card">
         <h3>📢 發布到銷售管道</h3>
         <button class="btn btn-upload" onclick="publishAll()">📢 發布所有商品</button>
         <button class="btn btn-check" onclick="getPublications()">📋 查看銷售管道</button>
     </div>
-    
+
     <div class="card">
         <h3>📊 執行狀態</h3>
         <div id="status">等待開始...</div>
         <div class="progress"><div class="progress-bar" id="progressBar" style="width:0%"></div></div>
     </div>
-    
+
     <div class="card">
         <h3>📋 執行記錄</h3>
         <div id="log"></div>
     </div>
-    
+
 <script>
 let currentJsonlFile = '';
 let lastProductCount = 0, lastProgress = 0, lastPhase = '', lastErrorCount = 0;
 
-// ===== 庫存同步 =====
 function startInventorySync() {
     if (!confirm('確定要開始庫存同步？')) return;
     log('🔄 開始庫存同步...'); document.getElementById('status').textContent = '庫存同步中...';
@@ -125,14 +124,14 @@ function pollInventorySyncStatus() {
         if(d.running) setTimeout(pollInventorySyncStatus,2000);
         else if(d.phase==='completed') {
             let r=d.results;
-            log('✅ 庫存同步完成！檢查:'+r.checked+' 有貨:'+r.in_stock+' 缺貨:'+r.out_of_stock+' 草稿:'+r.draft_set+' 歸零:'+r.inventory_zeroed);
+            log('✅ 庫存同步完成！檢查:'+r.checked+' 有貨:'+r.in_stock+' 缺貨:'+r.out_of_stock+' 已刪除:'+r.deleted);
             showSyncDetails(d);
         } else if(d.phase==='error') log('❌ 庫存同步失敗');
     });
 }
 function checkInventorySyncStatus() {
     fetch('/api/inventory_sync_status').then(r=>r.json()).then(d=>{
-        if(d.phase==='completed') { let r=d.results; log('📊 上次: 檢查'+r.checked+' 有貨'+r.in_stock+' 缺貨'+r.out_of_stock+' 草稿'+r.draft_set); showSyncDetails(d); }
+        if(d.phase==='completed') { let r=d.results; log('📊 上次: 檢查'+r.checked+' 有貨'+r.in_stock+' 缺貨'+r.out_of_stock+' 已刪除'+r.deleted); showSyncDetails(d); }
         else if(d.running) log('🔄 同步中: '+d.progress+'/'+d.total);
         else log('📊 尚未執行庫存同步');
     });
@@ -143,20 +142,17 @@ function showSyncDetails(data) {
     let oos=data.details.filter(d=>d.status!=='in_stock');
     let html='<h4>同步詳情</h4><table><tr><th>商品</th><th>狀態</th><th>原因</th></tr>';
     if(!oos.length) html+='<tr><td colspan="3">🎉 所有商品都有貨！</td></tr>';
-    else oos.forEach(d=>{html+='<tr><td>'+d.title+'</td><td>'+(d.status==='page_gone'?'🚫':'❌')+' '+d.status+'</td><td>'+(d.reason||'')+'</td></tr>';});
-    html+='</table><p style="font-size:12px;color:#666;">'+oos.length+' 個缺貨 / '+data.details.length+' 個已檢查</p>';
+    else oos.forEach(d=>{html+='<tr><td>'+d.title+'</td><td>'+(d.status==='page_gone'?'🚫 已刪除':'❌ 已刪除')+'</td><td>'+(d.reason||'')+'</td></tr>';});
+    html+='</table><p style="font-size:12px;color:#666;">'+oos.length+' 個缺貨已刪除 / '+data.details.length+' 個已檢查</p>';
     div.innerHTML=html; div.style.display='block';
 }
 function checkSingleStock() {
-    let url=prompt('請輸入 WORKMAN 商品 URL：\n例如: https://workman.jp/shop/g/g2300068265020/');
+    let url=prompt('請輸入 WORKMAN 商品 URL：');
     if(!url) return; log('🔍 檢查: '+url);
     fetch('/api/check_stock?url='+encodeURIComponent(url)).then(r=>r.json()).then(d=>{
         if(d.available) log('✅ 有貨！'); else log('❌ 缺貨: '+(d.out_of_stock_reason||'未知'));
-        log('   頁面存在: '+(d.page_exists?'是':'否'));
     });
 }
-
-// ===== 爬取與上傳 =====
 function startScrape(cat) {
     if(!confirm('確定爬取 '+cat+'？')) return;
     resetTracking(); document.getElementById('uploadBtn').disabled=true; document.getElementById('log').innerHTML='';
@@ -176,82 +172,20 @@ function pollBulkStatus() {
         else if(s==='RUNNING'||s==='CREATED') setTimeout(pollBulkStatus,3000);
     });
 }
-function checkStatus() {
-    fetch('/api/bulk_status').then(r=>r.json()).then(d=>{
-        log('📊 Bulk: '+d.status+', 處理:'+d.objectCount);
-        if(d.status==='COMPLETED'&&document.getElementById('autoPublish').checked) publishAll(true);
-    });
-}
-function checkResults() {
-    fetch('/api/bulk_results').then(r=>r.json()).then(d=>{
-        log('📊 狀態:'+d.status+' 總數:'+d.objectCount);
-        if(d.success_count!==undefined) log('✅'+d.success_count+' ❌'+d.error_count);
-    });
-}
-function startDelete() {
-    if(!confirm('⚠️ 確定刪除所有 WORKMAN 商品？')) return;
-    if(!confirm('再次確認？')) return;
-    resetTracking();
-    fetch('/api/delete').then(r=>r.json()).then(d=>{if(d.error) log('❌ '+d.error); else {log('🗑️ 開始刪除...'); pollStatus();}});
-}
-function countProducts() {
-    fetch('/api/count').then(r=>r.json()).then(d=>{log('📊 '+d.count+' 個 WORKMAN 商品');});
-}
-function publishAll(auto) {
-    if(!auto&&!confirm('確定發布？')) return;
-    log('📢 發布中...');
-    fetch('/api/publish_all').then(r=>r.json()).then(d=>{
-        if(d.error) log('❌ '+d.error);
-        else log('📢 發布完成！成功:'+d.success+' 失敗:'+d.failed);
-    });
-}
-function getPublications() {
-    fetch('/api/publications').then(r=>r.json()).then(d=>{
-        if(d.publications) d.publications.forEach(p=>log('   - '+p.name));
-    });
-}
-function testConnection() {
-    log('🔗 測試 workman.jp...');
-    fetch('/api/test_workman').then(r=>r.json()).then(d=>{
-        if(d.homepage&&d.homepage.ok) log('✅ 主頁OK'); else log('❌ 主頁失敗');
-        if(d.kids_page&&d.kids_page.ok) log('✅ 分類頁OK, 找到'+d.kids_page.goods_links_found+'個商品'); else log('❌ 分類頁失敗');
-    });
-}
-function testProductParse() {
-    fetch('/api/test_product').then(r=>r.json()).then(d=>{
-        log('📄 '+d.url+' HTTP:'+d.status);
-        if(d.title_found) log('✅ 標題:'+d.title); if(d.price_elem_found) log('✅ 價格:'+d.price_text);
-    });
-}
-function testShopify() {
-    fetch('/api/test').then(r=>r.json()).then(d=>{
-        if(d.data&&d.data.shop) log('✅ Shopify: '+d.data.shop.name); else log('❌ Shopify 失敗');
-    });
-}
-function testSingle() {
-    if(!confirm('測試單品上傳？')) return; log('🧪 測試中...');
-    fetch('/api/test_single').then(r=>r.json()).then(()=>pollTestStatus());
-}
-function pollTestStatus() {
-    fetch('/api/status').then(r=>r.json()).then(d=>{
-        document.getElementById('status').textContent=d.current_product||'';
-        if(d.running) setTimeout(pollTestStatus,1000); else checkTestResult();
-    });
-}
-function checkTestResult() {
-    fetch('/api/test_result').then(r=>r.json()).then(d=>{
-        let div=document.getElementById('testResult'); div.style.display='block';
-        if(d.errors&&d.errors.length) div.innerHTML='<b style="color:red">❌ '+d.errors.map(e=>e.error).join('<br>')+'</b>';
-        else if(d.test_result&&d.test_result.id) {let r=d.test_result; div.innerHTML='<b style="color:green">✅ 成功!</b><br>'+r.title+'<br>Handle: '+r.handle+'<br>發布: '+r.published+'個管道'; log('✅ '+r.title);}
-        else div.innerHTML='⏳ 尚無結果';
-    });
-}
-
-// ===== 通用 =====
+function checkStatus() { fetch('/api/bulk_status').then(r=>r.json()).then(d=>{ log('📊 Bulk: '+d.status+', 處理:'+d.objectCount); if(d.status==='COMPLETED'&&document.getElementById('autoPublish').checked) publishAll(true); }); }
+function checkResults() { fetch('/api/bulk_results').then(r=>r.json()).then(d=>{ log('📊 狀態:'+d.status+' 總數:'+d.objectCount); if(d.success_count!==undefined) log('✅'+d.success_count+' ❌'+d.error_count); }); }
+function startDelete() { if(!confirm('⚠️ 確定刪除所有 WORKMAN 商品？')) return; if(!confirm('再次確認？')) return; resetTracking(); fetch('/api/delete').then(r=>r.json()).then(d=>{if(d.error) log('❌ '+d.error); else {log('🗑️ 開始刪除...'); pollStatus();}}); }
+function countProducts() { fetch('/api/count').then(r=>r.json()).then(d=>{log('📊 '+d.count+' 個 WORKMAN 商品');}); }
+function publishAll(auto) { if(!auto&&!confirm('確定發布？')) return; log('📢 發布中...'); fetch('/api/publish_all').then(r=>r.json()).then(d=>{ if(d.error) log('❌ '+d.error); else log('📢 發布完成！成功:'+d.success+' 失敗:'+d.failed); }); }
+function getPublications() { fetch('/api/publications').then(r=>r.json()).then(d=>{ if(d.publications) d.publications.forEach(p=>log('   - '+p.name)); }); }
+function testConnection() { log('🔗 測試 workman.jp...'); fetch('/api/test_workman').then(r=>r.json()).then(d=>{ if(d.homepage&&d.homepage.ok) log('✅ 主頁OK'); else log('❌ 主頁失敗'); if(d.kids_page&&d.kids_page.ok) log('✅ 分類頁OK, 找到'+d.kids_page.goods_links_found+'個商品'); else log('❌ 分類頁失敗'); }); }
+function testProductParse() { fetch('/api/test_product').then(r=>r.json()).then(d=>{ log('📄 '+d.url+' HTTP:'+d.status); if(d.title_found) log('✅ 標題:'+d.title); if(d.price_elem_found) log('✅ 價格:'+d.price_text); }); }
+function testShopify() { fetch('/api/test').then(r=>r.json()).then(d=>{ if(d.data&&d.data.shop) log('✅ Shopify: '+d.data.shop.name); else log('❌ Shopify 失敗'); }); }
+function testSingle() { if(!confirm('測試單品上傳？')) return; log('🧪 測試中...'); fetch('/api/test_single').then(r=>r.json()).then(()=>pollTestStatus()); }
+function pollTestStatus() { fetch('/api/status').then(r=>r.json()).then(d=>{ document.getElementById('status').textContent=d.current_product||''; if(d.running) setTimeout(pollTestStatus,1000); else checkTestResult(); }); }
+function checkTestResult() { fetch('/api/test_result').then(r=>r.json()).then(d=>{ let div=document.getElementById('testResult'); div.style.display='block'; if(d.errors&&d.errors.length) div.innerHTML='<b style="color:red">❌ '+d.errors.map(e=>e.error).join('<br>')+'</b>'; else if(d.test_result&&d.test_result.id) {let r=d.test_result; div.innerHTML='<b style="color:green">✅ 成功!</b><br>'+r.title+'<br>Handle: '+r.handle+'<br>發布: '+r.published+'個管道'; log('✅ '+r.title);} else div.innerHTML='⏳ 尚無結果'; }); }
 function resetTracking() { lastProductCount=0; lastProgress=0; lastPhase=''; lastErrorCount=0; }
-function pollStatus() {
-    fetch('/api/status').then(r=>r.json()).then(d=>{updateUI(d); if(d.running) setTimeout(pollStatus,1000);});
-}
+function pollStatus() { fetch('/api/status').then(r=>r.json()).then(d=>{updateUI(d); if(d.running) setTimeout(pollStatus,1000);}); }
 function updateUI(d) {
     let pt={scraping:'爬取中',uploading:'上傳中',deleting:'刪除中',completed:'完成'}[d.phase]||d.phase;
     if(d.phase!==lastPhase) { log('📌 '+pt); lastPhase=d.phase; }
@@ -269,10 +203,7 @@ function updateUI(d) {
     if(d.errors.length>lastErrorCount) d.errors.slice(lastErrorCount).forEach(e=>log('❌ '+(e.error||e.url)));
     lastErrorCount=d.errors.length;
 }
-function log(msg) {
-    let div=document.getElementById('log'), t=new Date().toLocaleTimeString();
-    div.innerHTML='['+t+'] '+msg+'\n'+div.innerHTML;
-}
+function log(msg) { let div=document.getElementById('log'), t=new Date().toLocaleTimeString(); div.innerHTML='['+t+'] '+msg+'\n'+div.innerHTML; }
 pollStatus();
 </script>
 </body>

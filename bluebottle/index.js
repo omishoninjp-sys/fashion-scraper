@@ -10,7 +10,7 @@
 require('dotenv').config();
 const express = require('express');
 const cron = require('node-cron');
-const { syncProducts, fetchAllProducts, buildProductCategoryMap } = require('./lib/crawler');
+const { syncProducts, fetchAllProducts, buildProductCategoryMap, testUpload } = require('./lib/crawler');
 const { updateAllPrices } = require('./lib/price-tool');
 const { log, getLogs } = require('./lib/logger');
 
@@ -161,6 +161,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <button class="bs" id="b-fetch" onclick="doFetch()"><span class="sp" id="sp2"></span> 🔍 測試抓取</button>
     <button class="bo" id="b-price" onclick="doPrice()"><span class="sp" id="sp3"></span> 💰 更新價格</button>
     <button class="bo" onclick="loadLogs()">📋 重整日誌</button>
+  </div>
+  <div class="ctrls-row" style="margin-top:12px;align-items:center;">
+    <button class="bs" id="b-test" onclick="doTest()" style="background:#7c3aed;"><span class="sp" id="sp4"></span> 🧪 測試上架</button>
+    <input type="number" id="test-n" value="3" min="1" max="20" style="width:50px;padding:8px;border:1px solid #333;border-radius:6px;background:#1a1a1a;color:#fff;text-align:center;font-size:14px;">
+    <span style="color:#888;font-size:13px;">個商品（抓取→翻譯→實際上架到 Shopify）</span>
   </div></div>
 
   <div class="rp" id="rp">
@@ -211,6 +216,15 @@ alog('💰 更新價格中 (匯率: '+r+')...');
 try{const d=await api('POST','/api/price-update',{rate:parseFloat(r)});alog('✅ 價格更新完成，'+(d.updated||0)+' 個 variant');
 }catch(e){alog('❌ 更新失敗: '+e.message,1);}finally{b.disabled=false;s.style.display='none';}}
 
+async function doTest(){const n=parseInt($('test-n').value)||3;
+const b=$('b-test'),s=$('sp4');b.disabled=true;s.style.display='inline-block';
+alog('🧪 測試上架中 ('+n+' 個)...');
+try{const d=await api('POST','/api/test-upload',{count:n});
+showRP('🧪 測試上架結果','成功 '+d.created+' / 跳過 '+d.skipped+' / 失敗 '+d.errors, mkTestTbl(d.products));
+alog('✅ 測試上架完成: 成功 '+d.created+' / 跳過 '+d.skipped+' / 失敗 '+d.errors);
+await loadLogs();}catch(e){alog('❌ 測試上架失敗: '+e.message,1);}
+finally{b.disabled=false;s.style.display='none';}}
+
 async function loadLogs(){try{const d=await api('GET','/api/logs');const el=$('lc');
 el.innerHTML=(d.logs||[]).map(l=>{let c='';if(l.includes('✅')||l.includes('成功'))c='g';
 else if(l.includes('⚠')||l.includes('跳過'))c='w';else if(l.includes('❌')||l.includes('失敗'))c='e';
@@ -230,6 +244,18 @@ ps.forEach((p,i)=>{h+='<tr><td style="color:#666">'+(i+1)+'</td>'
 +'<td style="font-family:monospace;">¥'+Number(p.price).toLocaleString()+'</td>'
 +'<td style="text-align:center">'+p.variants+'</td><td style="text-align:center">'+p.images+'</td>'
 +'<td><span class="bd '+(p.available?'i':'o')+'">'+(p.available?'有庫存':'售罄')+'</span></td></tr>';});
+h+='</tbody></table>';return h;}
+
+function mkTestTbl(ps){if(!ps||!ps.length)return '<div style="text-align:center;color:#666;padding:20px;">📦 沒有結果</div>';
+let h='<table><thead><tr><th>#</th><th>Handle</th><th>名稱</th><th>日幣</th><th>狀態</th></tr></thead><tbody>';
+ps.forEach((p,i)=>{
+const sc=p.status==='success'?'i':(p.status==='error'?'o':'');
+const bg=p.status==='success'?'background:#052e16;color:#22c55e;':(p.status==='error'?'background:#2c0b0e;color:#ef4444;':'background:#1c1917;color:#a3a3a3;');
+h+='<tr><td style="color:#666">'+(i+1)+'</td>'
++'<td><code style="font-size:12px;background:#1a1a1a;padding:2px 6px;border-radius:3px;">'+esc(p.handle||'')+'</code></td>'
++'<td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+esc(p.title||'')+'</td>'
++'<td style="font-family:monospace;">¥'+Number(p.price||0).toLocaleString()+'</td>'
++'<td><span class="bd" style="'+bg+'">'+esc(p.status_text||'')+'</span></td></tr>';});
 h+='</tbody></table>';return h;}
 
 refreshStatus();loadLogs();setInterval(refreshStatus,15000);
@@ -289,6 +315,27 @@ app.post('/api/sync', (req, res) => {
   log('🔧 手動觸發同步');
   res.json({ message: '同步已開始', startedAt: new Date().toISOString() });
   runSync();
+});
+
+// 測試上架（抓取→翻譯→實際上架 N 個）
+app.post('/api/test-upload', async (req, res) => {
+  if (state.isRunning) {
+    return res.status(409).json({ error: '同步正在進行中，請稍後再試' });
+  }
+
+  const count = parseInt(req.body?.count) || 3;
+  state.isRunning = true;
+
+  try {
+    log(`🧪 手動觸發測試上架 (${count} 個)`);
+    const result = await testUpload(count);
+    res.json(result);
+  } catch (error) {
+    log(`❌ 測試上架失敗: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  } finally {
+    state.isRunning = false;
+  }
 });
 
 // 只抓取

@@ -525,8 +525,128 @@ async function syncProducts() {
   return result;
 }
 
+/**
+ * 測試上架：只抓取並上架前 N 個商品（跳過已存在的）
+ * 用來確認整個流程（抓取→翻譯→上架）是否正常
+ */
+async function testUpload(count = 3) {
+  log('========================================');
+  log(`🧪 測試上架模式：上架 ${count} 個商品`);
+  log('========================================');
+
+  // Step 1: 抓取來源商品
+  const sourceProducts = await fetchAllProducts();
+  if (sourceProducts.length === 0) {
+    log('❌ 未抓取到任何商品');
+    return { created: 0, skipped: 0, errors: 0, total: 0, products: [] };
+  }
+
+  // Step 2: 建立分類
+  const productCategories = await buildProductCategoryMap();
+
+  // Step 3: 逐一處理，直到成功上架 N 個
+  let created = 0, skipped = 0, errors = 0;
+  const products = []; // 前端顯示用
+
+  for (let i = 0; i < sourceProducts.length; i++) {
+    if (created >= count) break; // 已達目標數量
+
+    const source = sourceProducts[i];
+    log(`[${i + 1}/${sourceProducts.length}] ${source.title} (${source.handle})`);
+
+    // 跳過定期便
+    if (config.crawler.skipSubscription && source.handle?.startsWith('su')) {
+      log('  ⏭️ 跳過定期便');
+      products.push({ handle: source.handle, title: source.title, price: source.variants?.[0]?.price, status: 'skip', status_text: '定期便' });
+      skipped++;
+      continue;
+    }
+
+    // 跳過售罄
+    const isAvailable = source.variants?.some(v => v.available) ?? true;
+    if (!isAvailable) {
+      log('  ⏭️ 跳過售罄');
+      products.push({ handle: source.handle, title: source.title, price: source.variants?.[0]?.price, status: 'skip', status_text: '售罄' });
+      skipped++;
+      continue;
+    }
+
+    try {
+      // 翻譯
+      log('  🌐 翻譯中...');
+      const translated = await translateProduct(source);
+      await sleep(config.crawler.delayBetweenTranslations);
+
+      // 轉換
+      const categoryTags = productCategories[source.handle] || [];
+      const transformed = transformProduct(source, translated, categoryTags);
+      if (!transformed) {
+        products.push({ handle: source.handle, title: source.title, price: source.variants?.[0]?.price, status: 'skip', status_text: '轉換失敗' });
+        skipped++;
+        continue;
+      }
+
+      // 檢查是否已存在
+      const existing = await findProductByHandle(`bbc-${source.handle}`);
+      await sleep(300);
+
+      if (existing) {
+        log(`  ⏭️ 已存在 (ID: ${existing.id})`);
+        products.push({ handle: source.handle, title: translated.title || source.title, price: source.variants?.[0]?.price, status: 'skip', status_text: '已存在' });
+        skipped++;
+        continue;
+      }
+
+      // 上架
+      log('  🆕 上架中...');
+      transformed.variants = transformed.variants.map(v => {
+        const { _available, _source_id, ...clean } = v;
+        return clean;
+      });
+
+      const result = await createProduct(transformed);
+      if (result) {
+        // 設定售罄 variant 庫存
+        if (config.crawler.deleteUnavailableVariants) {
+          for (let vi = 0; vi < (source.variants || []).length; vi++) {
+            if (!source.variants[vi].available && result.variants[vi]) {
+              await setVariantUnavailable(result.variants[vi].id);
+            }
+          }
+        }
+        log(`  ✅ 上架成功: ${result.title} (ID: ${result.id})`);
+        products.push({
+          handle: source.handle,
+          title: transformed.title,
+          price: source.variants?.[0]?.price,
+          shopify_id: result.id,
+          status: 'success',
+          status_text: '已上架',
+        });
+        created++;
+      } else {
+        products.push({ handle: source.handle, title: source.title, price: source.variants?.[0]?.price, status: 'error', status_text: '上架失敗' });
+        errors++;
+      }
+
+      await sleep(config.crawler.delayBetweenRequests);
+    } catch (error) {
+      log(`  ❌ 失敗: ${error.message}`);
+      products.push({ handle: source.handle, title: source.title, price: source.variants?.[0]?.price, status: 'error', status_text: error.message.slice(0, 50) });
+      errors++;
+    }
+  }
+
+  log('========================================');
+  log(`🧪 測試上架完成: 成功 ${created} / 跳過 ${skipped} / 失敗 ${errors}`);
+  log('========================================');
+
+  return { created, skipped, errors, total: created + skipped + errors, products };
+}
+
 module.exports = {
   fetchAllProducts,
   buildProductCategoryMap,
   syncProducts,
+  testUpload,
 };

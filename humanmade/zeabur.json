@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.zeabur.app/template.json",
+  "build": {
+    "type": "docker"
+  },
+  "start": {
+    "command": "gunicorn --bind 0.0.0.0:$PORT --timeout 600 --workers 1 --threads 4 app:app"
+  },
+  "ports": [8080]
+}

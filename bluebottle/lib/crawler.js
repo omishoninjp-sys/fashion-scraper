@@ -474,9 +474,11 @@ function transformProduct(source, translated, categoryTags = []) {
   const isLimited = source.title?.includes('限定');
   const titlePrefix = 'Blue bottle 藍瓶咖啡｜';
   const limitedSuffix = isLimited ? '（限定）' : '';
-  const finalTitle = translated.title.startsWith(titlePrefix)
-    ? translated.title
-    : `${titlePrefix}${translated.title}${limitedSuffix}`;
+  // 清掉翻譯後殘留的【...限定】標記，避免跟我們加的（限定）重複
+  const cleanTitle = translated.title.replace(/【[^】]*限定】/g, '').trim();
+  const finalTitle = cleanTitle.startsWith(titlePrefix)
+    ? cleanTitle
+    : `${titlePrefix}${cleanTitle}${limitedSuffix}`;
 
   const descFooter = `
 <div class="product-source-info" style="margin-top:20px;padding:15px;background:#f7f7f7;border-radius:8px;">

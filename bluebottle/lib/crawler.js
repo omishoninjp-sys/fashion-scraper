@@ -337,7 +337,162 @@ async function setVariantUnavailable(variantId) {
 }
 
 // ============================================================
-// 4. 商品轉換
+// 4. GraphQL 銷售管道 & Collection
+// ============================================================
+
+let _publicationIds = null;
+
+function graphqlApi() {
+  return {
+    url: `https://${config.target.shop()}/admin/api/${config.target.apiVersion}/graphql.json`,
+    headers: {
+      'X-Shopify-Access-Token': config.target.accessToken(),
+      'Content-Type': 'application/json',
+    },
+  };
+}
+
+async function getPublicationIds() {
+  if (_publicationIds) return _publicationIds;
+
+  const gql = graphqlApi();
+  const query = '{ publications(first: 20) { edges { node { id name } } } }';
+
+  try {
+    const res = await axios.post(gql.url, { query }, { headers: gql.headers, timeout: 15000 });
+    const pubs = res.data?.data?.publications?.edges || [];
+    const seen = new Set();
+    _publicationIds = [];
+    for (const pub of pubs) {
+      if (!seen.has(pub.node.name)) {
+        seen.add(pub.node.name);
+        _publicationIds.push(pub.node.id);
+      }
+    }
+    log(`📡 找到 ${_publicationIds.length} 個銷售管道: ${[...seen].join(', ')}`);
+  } catch (e) {
+    log(`⚠️ 取得銷售管道失敗: ${e.message}`);
+    _publicationIds = [];
+  }
+
+  return _publicationIds;
+}
+
+async function publishToAllChannels(resourceType, resourceId) {
+  const pubIds = await getPublicationIds();
+  if (!pubIds.length) return;
+
+  const gql = graphqlApi();
+  const gid = `gid://shopify/${resourceType}/${resourceId}`;
+
+  if (resourceType === 'Collection') {
+    // Collection 用 collectionPublish mutation
+    const mutation = `
+      mutation collectionPublish($id: ID!, $input: CollectionPublishInput!) {
+        collectionPublish(id: $id, input: $input) {
+          collectionPublications { publishDate }
+          userErrors { field message }
+        }
+      }`;
+    const variables = {
+      id: gid,
+      input: { publicationIds: pubIds },
+    };
+    try {
+      const res = await axios.post(gql.url, { query: mutation, variables }, { headers: gql.headers, timeout: 15000 });
+      const errors = res.data?.data?.collectionPublish?.userErrors || [];
+      const real = errors.filter(e => !e.message?.includes('does not exist'));
+      if (real.length) log(`  ⚠️ Collection 發布警告: ${real.map(e => e.message).join(', ')}`);
+      else log(`  📡 Collection ${resourceId} 已發布到 ${pubIds.length} 個管道`);
+    } catch (e) {
+      log(`  ⚠️ Collection 發布失敗: ${e.message}`);
+    }
+  } else {
+    // Product 用 publishablePublish mutation
+    const mutation = `
+      mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+        publishablePublish(id: $id, input: $input) {
+          publishable { availablePublicationsCount { count } }
+          userErrors { field message }
+        }
+      }`;
+    const variables = {
+      id: gid,
+      input: pubIds.map(pid => ({ publicationId: pid })),
+    };
+    try {
+      const res = await axios.post(gql.url, { query: mutation, variables }, { headers: gql.headers, timeout: 15000 });
+      const errors = res.data?.data?.publishablePublish?.userErrors || [];
+      const real = errors.filter(e => !e.message?.includes('does not exist'));
+      const count = res.data?.data?.publishablePublish?.publishable?.availablePublicationsCount?.count || 0;
+      if (real.length) log(`  ⚠️ 發布警告: ${real.map(e => e.message).join(', ')}`);
+      else log(`  📡 Product ${resourceId} 已發布到 ${count} 個管道`);
+    } catch (e) {
+      log(`  ⚠️ Product 發布失敗: ${e.message}`);
+    }
+  }
+}
+
+const _collectionCache = {};
+
+async function ensureCollection(handle, title) {
+  if (_collectionCache[handle]) return _collectionCache[handle];
+
+  const api = shopifyApi();
+
+  // 查詢是否已存在
+  try {
+    const res = await api.get(`/custom_collections.json?handle=${handle}&limit=1`);
+    if (res.data.custom_collections.length > 0) {
+      const col = res.data.custom_collections[0];
+      _collectionCache[handle] = col.id;
+      return col.id;
+    }
+  } catch (e) {}
+
+  // 建立新的
+  try {
+    const res = await api.post('/custom_collections.json', {
+      custom_collection: {
+        title,
+        handle,
+        published: true,
+        sort_order: 'best-selling',
+      },
+    });
+    const col = res.data.custom_collection;
+    log(`  🏷️ 建立 Collection: ${title} (${col.id})`);
+
+    // 發布到所有管道
+    await publishToAllChannels('Collection', col.id);
+    await sleep(300);
+
+    _collectionCache[handle] = col.id;
+    return col.id;
+  } catch (e) {
+    log(`  ⚠️ 建立 Collection 失敗 (${handle}): ${e.message}`);
+    return null;
+  }
+}
+
+async function addProductToCollection(productId, collectionId) {
+  try {
+    const api = shopifyApi();
+    await api.post('/collects.json', {
+      collect: { product_id: productId, collection_id: collectionId },
+    });
+    return true;
+  } catch (e) {
+    // 409 = 已存在，不算錯
+    if (e.response?.status !== 409) {
+      log(`  ⚠️ 加入 Collection 失敗: ${e.message}`);
+    }
+    return false;
+  }
+}
+
+// ============================================================
+// 5. 商品轉換
 // ============================================================
 
 function transformProduct(source, translated, categoryTags = []) {
@@ -383,7 +538,7 @@ function transformProduct(source, translated, categoryTags = []) {
     alt: translated.title,
   })) || [];
 
-  const titlePrefix = '【藍瓶咖啡】';
+  const titlePrefix = 'Blue bottle 藍瓶咖啡｜';
   const finalTitle = translated.title.startsWith(titlePrefix)
     ? translated.title
     : `${titlePrefix}${translated.title}`;
@@ -517,6 +672,21 @@ async function syncProducts() {
               }
             }
           }
+
+          // 發布到所有銷售管道
+          await publishToAllChannels('Product', result.id);
+          await sleep(300);
+
+          // 加入 Collection
+          for (const tag of categoryTags) {
+            const colHandle = `bbc-${Object.entries(config.categoryMap).find(([, v]) => v === tag)?.[0] || tag}`;
+            const colId = await ensureCollection(colHandle, `藍瓶咖啡 ${tag}`);
+            if (colId) {
+              await addProductToCollection(result.id, colId);
+              await sleep(200);
+            }
+          }
+
           created++;
         } else {
           errors++;
@@ -628,6 +798,21 @@ async function testUpload(count = 3) {
             }
           }
         }
+
+        // 發布到所有銷售管道
+        await publishToAllChannels('Product', result.id);
+        await sleep(300);
+
+        // 加入 Collection（測試模式可能為空）
+        for (const tag of categoryTags) {
+          const colHandle = `bbc-${Object.entries(config.categoryMap).find(([, v]) => v === tag)?.[0] || tag}`;
+          const colId = await ensureCollection(colHandle, `藍瓶咖啡 ${tag}`);
+          if (colId) {
+            await addProductToCollection(result.id, colId);
+            await sleep(200);
+          }
+        }
+
         log(`  ✅ 上架成功: ${result.title} (ID: ${result.id})`);
         products.push({
           handle: source.handle,

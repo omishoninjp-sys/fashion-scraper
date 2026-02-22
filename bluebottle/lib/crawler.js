@@ -35,7 +35,6 @@ const config = {
     delayBetweenRequests: 1000,
     delayBetweenTranslations: 500,
     maxRetries: 3,
-    deleteUnavailableVariants: true,
     skipSubscription: true,
   },
 
@@ -309,33 +308,6 @@ async function deleteVariant(productId, variantId) {
   }
 }
 
-async function setVariantUnavailable(variantId) {
-  try {
-    const api = shopifyApi();
-    await api.put(`/variants/${variantId}.json`, {
-      variant: { id: variantId, inventory_management: 'shopify', inventory_policy: 'deny' },
-    });
-
-    const variantRes = await api.get(`/variants/${variantId}.json`);
-    const inventoryItemId = variantRes.data.variant.inventory_item_id;
-
-    const locRes = await api.get('/locations.json');
-    const locationId = locRes.data.locations[0]?.id;
-
-    if (locationId && inventoryItemId) {
-      await api.post('/inventory_levels/set.json', {
-        location_id: locationId,
-        inventory_item_id: inventoryItemId,
-        available: 0,
-      });
-    }
-    return true;
-  } catch (error) {
-    log(`  ⚠️ 設定售罄失敗 (${variantId}): ${error.message}`);
-    return false;
-  }
-}
-
 // ============================================================
 // 4. GraphQL 銷售管道 & Collection
 // ============================================================
@@ -433,48 +405,6 @@ async function publishToAllChannels(resourceType, resourceId) {
   }
 }
 
-const _collectionCache = {};
-
-async function ensureCollection(handle, title) {
-  if (_collectionCache[handle]) return _collectionCache[handle];
-
-  const api = shopifyApi();
-
-  // 查詢是否已存在
-  try {
-    const res = await api.get(`/custom_collections.json?handle=${handle}&limit=1`);
-    if (res.data.custom_collections.length > 0) {
-      const col = res.data.custom_collections[0];
-      _collectionCache[handle] = col.id;
-      return col.id;
-    }
-  } catch (e) {}
-
-  // 建立新的
-  try {
-    const res = await api.post('/custom_collections.json', {
-      custom_collection: {
-        title,
-        handle,
-        published: true,
-        sort_order: 'best-selling',
-      },
-    });
-    const col = res.data.custom_collection;
-    log(`  🏷️ 建立 Collection: ${title} (${col.id})`);
-
-    // 發布到所有管道
-    await publishToAllChannels('Collection', col.id);
-    await sleep(300);
-
-    _collectionCache[handle] = col.id;
-    return col.id;
-  } catch (e) {
-    log(`  ⚠️ 建立 Collection 失敗 (${handle}): ${e.message}`);
-    return null;
-  }
-}
-
 async function addProductToCollection(productId, collectionId) {
   try {
     const api = shopifyApi();
@@ -500,48 +430,53 @@ function transformProduct(source, translated, categoryTags = []) {
     return null;
   }
 
+  // 沒貨的不上架
   const isAvailable = source.variants?.some(v => v.available) ?? true;
+  if (!isAvailable) return null;
 
   const tags = ['Blue Bottle Coffee', '藍瓶咖啡', '日本代購', ...categoryTags];
-  if (!isAvailable) tags.push('售罄');
   if (source.title?.includes('ヒューマンメイド') || source.title?.includes('Human Made')) {
     tags.push('Human Made 聯名');
   }
   if (source.title?.includes('オンライン限定')) tags.push('線上限定');
   if (source.title?.includes('期間限定')) tags.push('期間限定');
 
-  const variants = source.variants?.map(v => {
-    const weightKg = v.grams ? v.grams / 1000 : 0;
-    const originalJpy = parseFloat(v.price) || 0;
-    const sellingPrice = calculatePrice(originalJpy);
+  // 只保留有貨的 variant，不管理庫存
+  const variants = (source.variants || [])
+    .filter(v => v.available)
+    .map(v => {
+      const weightKg = v.grams ? v.grams / 1000 : 0;
+      const originalJpy = parseFloat(v.price) || 0;
+      const sellingPrice = calculatePrice(originalJpy);
 
-    return {
-      title: v.title,
-      price: sellingPrice.toString(),
-      compare_at_price: null,
-      sku: `BBC-${v.sku || source.handle}-${v.id}`,
-      weight: weightKg || null,
-      weight_unit: 'kg',
-      inventory_management: 'shopify',
-      inventory_policy: 'deny',
-      requires_shipping: true,
-      option1: v.option1,
-      option2: v.option2,
-      option3: v.option3,
-      _available: v.available,
-      _source_id: v.id,
-    };
-  }) || [];
+      return {
+        title: v.title,
+        price: sellingPrice.toString(),
+        compare_at_price: null,
+        sku: `BBC-${v.sku || source.handle}-${v.id}`,
+        weight: weightKg || null,
+        weight_unit: 'kg',
+        inventory_management: null,
+        requires_shipping: true,
+        option1: v.option1,
+        option2: v.option2,
+        option3: v.option3,
+      };
+    });
+
+  if (variants.length === 0) return null;
 
   const images = source.images?.map(img => ({
     src: img.src,
     alt: translated.title,
   })) || [];
 
+  const isLimited = source.title?.includes('限定');
   const titlePrefix = 'Blue bottle 藍瓶咖啡｜';
+  const limitedSuffix = isLimited ? '（限定）' : '';
   const finalTitle = translated.title.startsWith(titlePrefix)
     ? translated.title
-    : `${titlePrefix}${translated.title}`;
+    : `${titlePrefix}${translated.title}${limitedSuffix}`;
 
   const descFooter = `
 <div class="product-source-info" style="margin-top:20px;padding:15px;background:#f7f7f7;border-radius:8px;">
@@ -558,7 +493,7 @@ function transformProduct(source, translated, categoryTags = []) {
     vendor: 'Blue Bottle Coffee',
     product_type: categoryTags[0] || '咖啡',
     tags: tags.join(', '),
-    published: isAvailable,
+    published: true,
     variants,
     images,
     options: source.options?.map(opt => ({
@@ -574,25 +509,19 @@ function transformProduct(source, translated, categoryTags = []) {
 }
 
 // ============================================================
-// 5. Variant 同步
+// 5. Variant 同步（更新時移除已售罄的 variant）
 // ============================================================
 
 async function syncVariants(existing, transformed) {
-  const sourceVariants = transformed.variants || [];
+  const newSkus = new Set(transformed.variants.map(v => v.sku));
   const existingVariants = existing.variants || [];
 
+  // 刪除不再有貨的 variant
   for (const ev of existingVariants) {
-    const matching = sourceVariants.find(sv => sv.sku === ev.sku);
-
-    if (matching && !matching._available) {
-      if (existingVariants.length > 1) {
-        log(`    🗑️ 刪除售罄 variant: ${ev.title}`);
-        await deleteVariant(existing.id, ev.id);
-        await sleep(300);
-      } else {
-        log(`    📦 設定售罄: ${ev.title}`);
-        await setVariantUnavailable(ev.id);
-      }
+    if (!newSkus.has(ev.sku) && existingVariants.length > 1) {
+      log(`    🗑️ 刪除無貨 variant: ${ev.title}`);
+      await deleteVariant(existing.id, ev.id);
+      await sleep(300);
     }
   }
 }
@@ -600,6 +529,47 @@ async function syncVariants(existing, transformed) {
 // ============================================================
 // 6. 主要同步
 // ============================================================
+
+// 固定 Collection 名稱，你已手動建好
+const MAIN_COLLECTION_TITLE = 'Blue bottle 藍瓶咖啡';
+
+let _mainCollectionId = null;
+
+async function findOrCreateMainCollection() {
+  if (_mainCollectionId) return _mainCollectionId;
+
+  const api = shopifyApi();
+
+  // 先用 title 搜尋已存在的
+  try {
+    const res = await api.get(`/custom_collections.json?title=${encodeURIComponent(MAIN_COLLECTION_TITLE)}&limit=1`);
+    if (res.data.custom_collections.length > 0) {
+      _mainCollectionId = res.data.custom_collections[0].id;
+      log(`📂 找到主系列: ${MAIN_COLLECTION_TITLE} (ID: ${_mainCollectionId})`);
+      return _mainCollectionId;
+    }
+  } catch (e) {}
+
+  // 不存在就建立
+  try {
+    const res = await api.post('/custom_collections.json', {
+      custom_collection: {
+        title: MAIN_COLLECTION_TITLE,
+        published: true,
+        sort_order: 'best-selling',
+      },
+    });
+    const col = res.data.custom_collection;
+    _mainCollectionId = col.id;
+    log(`🏷️ 建立主系列: ${MAIN_COLLECTION_TITLE} (ID: ${col.id})`);
+    await publishToAllChannels('Collection', col.id);
+    await sleep(300);
+    return _mainCollectionId;
+  } catch (e) {
+    log(`⚠️ 建立主系列失敗: ${e.message}`);
+    return null;
+  }
+}
 
 async function syncProducts() {
   log('========================================');
@@ -613,6 +583,9 @@ async function syncProducts() {
   }
 
   const productCategories = await buildProductCategoryMap();
+
+  // 取得主系列 ID
+  const mainColId = await findOrCreateMainCollection();
 
   let created = 0, updated = 0, skipped = 0, errors = 0;
 
@@ -634,7 +607,12 @@ async function syncProducts() {
       const categoryTags = productCategories[source.handle] || [];
       const transformed = transformProduct(source, translated, categoryTags);
 
-      if (!transformed) { skipped++; continue; }
+      // transformProduct 回傳 null = 沒貨或定期便，跳過
+      if (!transformed) {
+        log('  ⏭️ 跳過（無貨/不符合）');
+        skipped++;
+        continue;
+      }
 
       const existing = await findProductByHandle(`bbc-${source.handle}`);
       await sleep(300);
@@ -642,49 +620,31 @@ async function syncProducts() {
       if (existing) {
         log(`  🔄 更新 (ID: ${existing.id})`);
 
-        if (config.crawler.deleteUnavailableVariants) {
-          await syncVariants(existing, transformed);
-        }
+        // 同步 variant（移除已售罄的）
+        await syncVariants(existing, transformed);
 
         const result = await updateProduct(existing.id, {
           id: existing.id,
           title: transformed.title,
           body_html: transformed.body_html,
           tags: transformed.tags,
-          published: transformed.published,
+          published: true,
         });
 
         result ? updated++ : errors++;
       } else {
         log('  🆕 建立新商品');
 
-        transformed.variants = transformed.variants.map(v => {
-          const { _available, _source_id, ...clean } = v;
-          return clean;
-        });
-
         const result = await createProduct(transformed);
         if (result) {
-          if (config.crawler.deleteUnavailableVariants) {
-            for (let vi = 0; vi < (source.variants || []).length; vi++) {
-              if (!source.variants[vi].available && result.variants[vi]) {
-                await setVariantUnavailable(result.variants[vi].id);
-              }
-            }
-          }
-
           // 發布到所有銷售管道
           await publishToAllChannels('Product', result.id);
           await sleep(300);
 
-          // 加入 Collection
-          for (const tag of categoryTags) {
-            const colHandle = `bbc-${Object.entries(config.categoryMap).find(([, v]) => v === tag)?.[0] || tag}`;
-            const colId = await ensureCollection(colHandle, `藍瓶咖啡 ${tag}`);
-            if (colId) {
-              await addProductToCollection(result.id, colId);
-              await sleep(200);
-            }
+          // 加入主系列
+          if (mainColId) {
+            await addProductToCollection(result.id, mainColId);
+            await sleep(200);
           }
 
           created++;
@@ -783,34 +743,18 @@ async function testUpload(count = 3) {
 
       // 上架
       log('  🆕 上架中...');
-      transformed.variants = transformed.variants.map(v => {
-        const { _available, _source_id, ...clean } = v;
-        return clean;
-      });
 
       const result = await createProduct(transformed);
       if (result) {
-        // 設定售罄 variant 庫存
-        if (config.crawler.deleteUnavailableVariants) {
-          for (let vi = 0; vi < (source.variants || []).length; vi++) {
-            if (!source.variants[vi].available && result.variants[vi]) {
-              await setVariantUnavailable(result.variants[vi].id);
-            }
-          }
-        }
-
         // 發布到所有銷售管道
         await publishToAllChannels('Product', result.id);
         await sleep(300);
 
-        // 加入 Collection（測試模式可能為空）
-        for (const tag of categoryTags) {
-          const colHandle = `bbc-${Object.entries(config.categoryMap).find(([, v]) => v === tag)?.[0] || tag}`;
-          const colId = await ensureCollection(colHandle, `藍瓶咖啡 ${tag}`);
-          if (colId) {
-            await addProductToCollection(result.id, colId);
-            await sleep(200);
-          }
+        // 加入主系列
+        const mainColId = await findOrCreateMainCollection();
+        if (mainColId) {
+          await addProductToCollection(result.id, mainColId);
+          await sleep(200);
         }
 
         log(`  ✅ 上架成功: ${result.title} (ID: ${result.id})`);

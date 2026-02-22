@@ -1,9 +1,0 @@
-{
-  "$schema": "https://json-schema.zeabur.com/config.json",
-  "build": {
-    "buildCommand": "pip install -r requirements.txt"
-  },
-  "start": {
-    "startCommand": "gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 1800"
-  }
-}

@@ -591,14 +591,14 @@ function transformProduct(source, translated, categoryTags = []) {
 <div class="product-source-info" style="margin-top:20px;padding:15px;background:#f7f7f7;border-radius:8px;">
   <p style="margin:0 0 8px;font-weight:bold;">📦 日本 Blue Bottle Coffee 官方商品</p>
   <p style="margin:0 0 5px;font-size:14px;">• 日本官網直送，100% 正品保證</p>
-  <p style="margin:0 0 5px;font-size:14px;">• 商品來源：<a href="${config.source.baseUrl}/products/${source.handle}" target="_blank">Blue Bottle Coffee Japan</a></p>
+  <p style="margin:0 0 5px;font-size:14px;">• 商品來源：Blue Bottle Coffee Japan</p>
   <p style="margin:0;font-size:14px;">• 到貨時間約 7-14 個工作天</p>
 </div>`;
 
   return {
     title: finalTitle,
     handle: `bbc-${source.handle}`,
-    body_html: (translated.body_html || '') + descFooter,
+    body_html: ((translated.body_html || '').replace(/<a\b[^>]*>(.*?)<\/a>/gi, '$1')) + descFooter,
     vendor: 'Blue Bottle Coffee',
     product_type: categoryTags[0] || '咖啡',
     tags: tags.join(', '),

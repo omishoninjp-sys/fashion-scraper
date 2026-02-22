@@ -1,40 +1,27 @@
 /**
  * 價格計算工具
- * JPY → TWD 含代購費用、運費、利潤
+ * 公式: 日幣 / 0.7 + 重量(kg) * 1250 = Shopify 零售價
  */
 
 const axios = require('axios');
 const { log } = require('./logger');
 
-function getPriceConfig(overrideRate) {
-  return {
-    exchangeRate: overrideRate || parseFloat(process.env.JPY_TO_TWD_RATE) || 0.22,
-    serviceFeeRate: parseFloat(process.env.SERVICE_FEE_RATE) || 0.10,
-    shippingPerItem: parseFloat(process.env.SHIPPING_PER_ITEM) || 150,
-    profitMargin: parseFloat(process.env.PROFIT_MARGIN) || 0.15,
-    minProfit: parseFloat(process.env.MIN_PROFIT) || 50,
-    roundTo: 10,
-  };
-}
+const DIVISOR = parseFloat(process.env.PRICE_DIVISOR) || 0.7;
+const WEIGHT_MULTIPLIER = parseFloat(process.env.WEIGHT_MULTIPLIER) || 1250;
+const ROUND_TO = parseInt(process.env.PRICE_ROUND_TO) || 10;
 
-function calculateTWDPrice(jpyPrice, overrideRate) {
-  const cfg = getPriceConfig(overrideRate);
+function calculatePrice(jpyPrice, weightKg = 0) {
   const jpy = parseFloat(jpyPrice);
   if (isNaN(jpy) || jpy <= 0) return 0;
 
-  const baseTWD = jpy * cfg.exchangeRate;
-  const withServiceFee = baseTWD * (1 + cfg.serviceFeeRate);
-  const withShipping = withServiceFee + cfg.shippingPerItem;
-  const profit = Math.max(withShipping * cfg.profitMargin, cfg.minProfit);
-  const finalPrice = withShipping + profit;
+  const wt = parseFloat(weightKg) || 0;
+  const raw = jpy / DIVISOR + wt * WEIGHT_MULTIPLIER;
 
-  return Math.ceil(finalPrice / cfg.roundTo) * cfg.roundTo;
+  return Math.ceil(raw / ROUND_TO) * ROUND_TO;
 }
 
-async function updateAllPrices(overrideRate) {
-  const cfg = getPriceConfig(overrideRate);
-
-  log(`💰 價格更新: 匯率 ${cfg.exchangeRate}, 服務費 ${cfg.serviceFeeRate * 100}%, 運費 NT$${cfg.shippingPerItem}, 利潤 ${cfg.profitMargin * 100}%`);
+async function updateAllPrices() {
+  log(`💰 價格更新: 公式 = JPY / ${DIVISOR} + 重量(kg) × ${WEIGHT_MULTIPLIER}`);
 
   const api = axios.create({
     baseURL: `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10`,
@@ -57,12 +44,13 @@ async function updateAllPrices(overrideRate) {
     for (const product of products) {
       for (const variant of product.variants) {
         const jpyPrice = parseFloat(variant.price);
-        const twdPrice = calculateTWDPrice(jpyPrice, overrideRate);
+        const weightKg = variant.grams ? variant.grams / 1000 : 0;
+        const newPrice = calculatePrice(jpyPrice, weightKg);
 
-        if (twdPrice > 0) {
+        if (newPrice > 0) {
           try {
             await api.put(`/variants/${variant.id}.json`, {
-              variant: { id: variant.id, price: twdPrice.toString() },
+              variant: { id: variant.id, price: newPrice.toString() },
             });
             updatedCount++;
           } catch (error) {
@@ -77,7 +65,7 @@ async function updateAllPrices(overrideRate) {
   }
 
   log(`✅ 價格更新完成: ${updatedCount} 個 variant`);
-  return { updated: updatedCount, rate: cfg.exchangeRate };
+  return { updated: updatedCount };
 }
 
-module.exports = { calculateTWDPrice, updateAllPrices };
+module.exports = { calculatePrice, updateAllPrices };

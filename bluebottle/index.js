@@ -140,7 +140,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
 <div class="container">
   <div class="header"><div class="logo">☕</div><h1>Blue Bottle Coffee <span>爬蟲控制台</span></h1></div>
-  <p class="subtitle">Shopify JSON API 爬蟲 → OpenAI 翻譯 → 自動上架 | 排程: %%SCHEDULE%% (%%TZ%%)</p>
+  <p class="subtitle">Shopify JSON API 爬蟲 → OpenAI 翻譯 → 自動上架 | 定價: 日幣÷0.7+1250 | 排程: %%SCHEDULE%% (%%TZ%%)</p>
 
   <div class="config-check">
     <h3 style="margin-bottom:10px;font-size:14px;">⚙️ 環境設定</h3>
@@ -210,10 +210,10 @@ try{const d=await api('POST','/api/fetch-only');showRP('抓取結果',d.count+' 
 alog('✅ 成功抓取 '+d.count+' 個商品');}catch(e){alog('❌ 抓取失敗: '+e.message,1);}
 finally{b.disabled=false;s.style.display='none';}}
 
-async function doPrice(){const r=prompt('請輸入日圓匯率 (1 JPY = ? TWD)','0.22');if(r===null)return;
+async function doPrice(){if(!confirm('確定要重新計算所有商品價格？\\n公式: 日幣/0.7 + 重量(kg)×1250'))return;
 const b=$('b-price'),s=$('sp3');b.disabled=true;s.style.display='inline-block';
-alog('💰 更新價格中 (匯率: '+r+')...');
-try{const d=await api('POST','/api/price-update',{rate:parseFloat(r)});alog('✅ 價格更新完成，'+(d.updated||0)+' 個 variant');
+alog('💰 更新價格中 (JPY/0.7 + 重量×1250)...');
+try{const d=await api('POST','/api/price-update');alog('✅ 價格更新完成，'+(d.updated||0)+' 個 variant');
 }catch(e){alog('❌ 更新失敗: '+e.message,1);}finally{b.disabled=false;s.style.display='none';}}
 
 async function doTest(){const n=parseInt($('test-n').value)||3;
@@ -362,10 +362,9 @@ app.post('/api/fetch-only', async (req, res) => {
 
 // 更新價格
 app.post('/api/price-update', async (req, res) => {
-  const rate = parseFloat(req.body?.rate) || undefined;
   try {
-    log(`🔧 手動觸發價格更新${rate ? ` (匯率: ${rate})` : ''}`);
-    const result = await updateAllPrices(rate);
+    log('🔧 手動觸發價格更新');
+    const result = await updateAllPrices();
     res.json({ success: true, ...result });
   } catch (error) {
     res.status(500).json({ error: error.message });

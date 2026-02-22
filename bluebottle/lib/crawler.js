@@ -5,6 +5,7 @@
 
 const axios = require('axios');
 const { log } = require('./logger');
+const { calculatePrice } = require('./price-tool');
 
 // ============================================================
 // 設定
@@ -348,22 +349,28 @@ function transformProduct(source, translated, categoryTags = []) {
   if (source.title?.includes('オンライン限定')) tags.push('線上限定');
   if (source.title?.includes('期間限定')) tags.push('期間限定');
 
-  const variants = source.variants?.map(v => ({
-    title: v.title,
-    price: v.price,
-    compare_at_price: v.compare_at_price || null,
-    sku: `BBC-${v.sku || source.handle}-${v.id}`,
-    weight: v.grams ? v.grams / 1000 : null,
-    weight_unit: 'kg',
-    inventory_management: 'shopify',
-    inventory_policy: 'deny',
-    requires_shipping: true,
-    option1: v.option1,
-    option2: v.option2,
-    option3: v.option3,
-    _available: v.available,
-    _source_id: v.id,
-  })) || [];
+  const variants = source.variants?.map(v => {
+    const weightKg = v.grams ? v.grams / 1000 : 0;
+    const originalJpy = parseFloat(v.price) || 0;
+    const sellingPrice = calculatePrice(originalJpy);
+
+    return {
+      title: v.title,
+      price: sellingPrice.toString(),
+      compare_at_price: null,
+      sku: `BBC-${v.sku || source.handle}-${v.id}`,
+      weight: weightKg || null,
+      weight_unit: 'kg',
+      inventory_management: 'shopify',
+      inventory_policy: 'deny',
+      requires_shipping: true,
+      option1: v.option1,
+      option2: v.option2,
+      option3: v.option3,
+      _available: v.available,
+      _source_id: v.id,
+    };
+  }) || [];
 
   const images = source.images?.map(img => ({
     src: img.src,

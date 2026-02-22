@@ -237,12 +237,13 @@ el.innerHTML+='<div class="'+c+'">['+t+'] '+esc(m)+'</div>';el.scrollTop=el.scro
 function showRP(t,bg,h){const p=$('rp');p.style.display='';$('rp-t').textContent=t;$('rp-bg').textContent=bg;$('rp-bd').innerHTML=h;}
 
 function mkTbl(ps){if(!ps||!ps.length)return '<div style="text-align:center;color:#666;padding:20px;">📦 沒有商品</div>';
-let h='<table><thead><tr><th>#</th><th>Handle</th><th>名稱</th><th>價格</th><th>V</th><th>圖</th><th>狀態</th></tr></thead><tbody>';
+let h='<table><thead><tr><th>#</th><th>Handle</th><th>名稱</th><th>價格</th><th>V</th><th>圖</th><th>V圖</th><th>狀態</th></tr></thead><tbody>';
 ps.forEach((p,i)=>{h+='<tr><td style="color:#666">'+(i+1)+'</td>'
 +'<td><code style="font-size:12px;background:#1a1a1a;padding:2px 6px;border-radius:3px;">'+esc(p.handle)+'</code></td>'
 +'<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'+esc(p.title)+'</td>'
 +'<td style="font-family:monospace;">¥'+Number(p.price).toLocaleString()+'</td>'
 +'<td style="text-align:center">'+p.variants+'</td><td style="text-align:center">'+p.images+'</td>'
++'<td style="text-align:center;font-size:11px;">'+esc(p.variantImgSource||'-')+'</td>'
 +'<td><span class="bd '+(p.available?'i':'o')+'">'+(p.available?'有庫存':'售罄')+'</span></td></tr>';});
 h+='</tbody></table>';return h;}
 
@@ -348,14 +349,20 @@ app.post('/api/fetch-only', async (req, res) => {
     res.json({
       success: true,
       count: products.length,
-      products: products.map(p => ({
-        handle: p.handle,
-        title: p.title,
-        price: p.variants?.[0]?.price,
-        available: p.variants?.some(v => v.available),
-        variants: p.variants?.length,
-        images: p.images?.length,
-      })),
+      products: products.map(p => {
+        // 檢查 variant 圖片來源
+        const hasVariantIds = p.images?.some(img => img.variant_ids?.length > 0);
+        const hasFeaturedImage = p.variants?.some(v => v.featured_image?.src);
+        return {
+          handle: p.handle,
+          title: p.title,
+          price: p.variants?.[0]?.price,
+          available: p.variants?.some(v => v.available),
+          variants: p.variants?.length,
+          images: p.images?.length,
+          variantImgSource: hasVariantIds ? 'variant_ids' : (hasFeaturedImage ? 'featured_image' : '無'),
+        };
+      }),
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

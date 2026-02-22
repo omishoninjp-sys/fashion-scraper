@@ -276,13 +276,97 @@ async function findProductByHandle(handle) {
 async function createProduct(data) {
   try {
     const api = shopifyApi();
-    const res = await api.post('/products.json', { product: data });
-    return res.data.product;
+    // 暫存 hints，不送給 Shopify
+    const imageHints = data._variantImageHints;
+    const metafields = data.metafields;
+    const { _variantImageHints, metafields: _, ...cleanData } = data;
+
+    const res = await api.post('/products.json', { product: cleanData });
+    const product = res.data.product;
+
+    // 建立 metafields
+    if (metafields?.length && product?.id) {
+      await createProductMetafields(product.id, metafields);
+    }
+
+    // 對應 variant 圖片
+    if (imageHints?.length && product?.id) {
+      await assignVariantImages(product, imageHints);
+    }
+
+    return product;
   } catch (error) {
     const msg = error.response ? JSON.stringify(error.response.data) : error.message;
     log(`  ❌ 建立失敗: ${msg}`);
     return null;
   }
+}
+
+async function createProductMetafields(productId, metafields) {
+  const api = shopifyApi();
+  for (const mf of metafields) {
+    try {
+      await api.post(`/products/${productId}/metafields.json`, { metafield: mf });
+      log(`  📝 metafield 寫入成功: ${mf.namespace}.${mf.key}`);
+    } catch (e) {
+      const errMsg = e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message;
+      log(`  ⚠️ metafield 寫入失敗 (${mf.namespace}.${mf.key}): ${errMsg}`);
+    }
+    await sleep(200);
+  }
+}
+
+async function assignVariantImages(product, imageHints) {
+  if (!product.images?.length || !product.variants?.length) {
+    log(`  🖼️ 無法對應 variant 圖片: images=${product.images?.length || 0}, variants=${product.variants?.length || 0}`);
+    return;
+  }
+
+  const validHints = imageHints.filter(Boolean).length;
+  if (validHints === 0) {
+    log(`  🖼️ 來源未提供 variant 圖片對應資訊`);
+    return;
+  }
+
+  const api = shopifyApi();
+
+  // 建立 src → image_id 的對應（比對不含 query string 的 URL）
+  const srcToId = {};
+  for (const img of product.images) {
+    const cleanSrc = img.src?.split('?')[0];
+    if (cleanSrc) srcToId[cleanSrc] = img.id;
+  }
+
+  let assigned = 0;
+  for (let i = 0; i < product.variants.length; i++) {
+    const hintSrc = imageHints[i];
+    if (!hintSrc) continue;
+
+    // 找到對應的 image_id
+    const cleanHint = hintSrc.split('?')[0];
+    // Shopify 上傳後 URL 會不同，用檔名匹配
+    const hintFilename = cleanHint.split('/').pop();
+    let imageId = null;
+
+    for (const [src, id] of Object.entries(srcToId)) {
+      if (src.includes(hintFilename)) {
+        imageId = id;
+        break;
+      }
+    }
+
+    if (imageId) {
+      try {
+        await api.put(`/variants/${product.variants[i].id}.json`, {
+          variant: { id: product.variants[i].id, image_id: imageId },
+        });
+        assigned++;
+      } catch (e) {}
+      await sleep(200);
+    }
+  }
+
+  if (assigned > 0) log(`  🖼️ ${assigned} 個 variant 圖片已對應`);
 }
 
 async function updateProduct(id, data) {
@@ -466,10 +550,33 @@ function transformProduct(source, translated, categoryTags = []) {
 
   if (variants.length === 0) return null;
 
+  // 建立 source variant_id → image src 的對應
+  const variantImageMap = {};
+  // 方法 1: 從 images 的 variant_ids 取得
+  for (const img of (source.images || [])) {
+    if (img.variant_ids?.length) {
+      for (const vid of img.variant_ids) {
+        variantImageMap[vid] = img.src;
+      }
+    }
+  }
+  // 方法 2: 從 variant 的 featured_image 取得（fallback）
+  for (const v of (source.variants || [])) {
+    if (!variantImageMap[v.id] && v.featured_image?.src) {
+      variantImageMap[v.id] = v.featured_image.src;
+    }
+  }
+
   const images = source.images?.map(img => ({
     src: img.src,
     alt: translated.title,
   })) || [];
+
+  // 把 variant image 資訊暫存，建立商品後用來對應
+  const availableSourceVariants = (source.variants || []).filter(v => v.available);
+  const _variantImageHints = availableSourceVariants.map(v => variantImageMap[v.id] || null);
+  const hintCount = _variantImageHints.filter(Boolean).length;
+  if (hintCount > 0) log(`  🖼️ 找到 ${hintCount}/${availableSourceVariants.length} 個 variant 圖片對應`);
 
   const isLimited = source.title?.includes('限定');
   const titlePrefix = 'Blue bottle 藍瓶咖啡｜';
@@ -503,10 +610,11 @@ function transformProduct(source, translated, categoryTags = []) {
       values: opt.values || ['Default Title'],
     })),
     metafields: [
-      { namespace: 'source', key: 'original_url', value: `${config.source.baseUrl}/products/${source.handle}`, type: 'single_line_text_field' },
+      { namespace: 'custom', key: 'link', value: `${config.source.baseUrl}/products/${source.handle}`, type: 'url' },
       { namespace: 'source', key: 'original_price_jpy', value: source.variants?.[0]?.price || '0', type: 'single_line_text_field' },
       { namespace: 'source', key: 'last_synced', value: new Date().toISOString(), type: 'single_line_text_field' },
     ],
+    _variantImageHints,
   };
 }
 

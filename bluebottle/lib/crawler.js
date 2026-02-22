@@ -18,7 +18,10 @@ const config = {
   },
 
   target: {
-    shop: () => process.env.SHOPIFY_SHOP,
+    shop: () => {
+      const s = process.env.SHOPIFY_SHOP || '';
+      return s.includes('.') ? s : `${s}.myshopify.com`;
+    },
     accessToken: () => process.env.SHOPIFY_ACCESS_TOKEN,
     apiVersion: '2024-10',
   },

@@ -269,7 +269,9 @@ refreshStatus();loadLogs();setInterval(refreshStatus,15000);
 
 // 控制台首頁 (HTML)
 app.get('/', (req, res) => {
-  const shopOk = !!(process.env.SHOPIFY_SHOP && process.env.SHOPIFY_ACCESS_TOKEN);
+  const shopRaw = process.env.SHOPIFY_SHOP || '';
+  const shopDomain = shopRaw.includes('.') ? shopRaw : `${shopRaw}.myshopify.com`;
+  const shopOk = !!(shopRaw && process.env.SHOPIFY_ACCESS_TOKEN);
   const oaiOk = !!process.env.OPENAI_API_KEY;
   const keyOk = !!process.env.API_KEY;
 
@@ -277,7 +279,7 @@ app.get('/', (req, res) => {
     .replace('%%SCHEDULE%%', CRON_SCHEDULE)
     .replace('%%TZ%%', process.env.TZ || 'Asia/Taipei')
     .replace('%%C_SHOP%%', shopOk ? 'ok' : 'miss')
-    .replace('%%S_SHOP%%', shopOk ? '✓ ' + process.env.SHOPIFY_SHOP : '✗ 未設定')
+    .replace('%%S_SHOP%%', shopOk ? '✓ ' + shopDomain : '✗ 未設定')
     .replace('%%C_OAI%%', oaiOk ? 'ok' : 'miss')
     .replace('%%S_OAI%%', oaiOk ? '✓ 已設定' : '✗ 未設定（將跳過翻譯）')
     .replace('%%C_KEY%%', keyOk ? 'ok' : 'miss')

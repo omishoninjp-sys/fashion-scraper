@@ -23,8 +23,11 @@ function calculatePrice(jpyPrice, weightKg = 0) {
 async function updateAllPrices() {
   log(`💰 價格更新: 公式 = JPY / ${DIVISOR} + 重量(kg) × ${WEIGHT_MULTIPLIER}`);
 
+  const shop = process.env.SHOPIFY_SHOP || '';
+  const shopDomain = shop.includes('.') ? shop : `${shop}.myshopify.com`;
+
   const api = axios.create({
-    baseURL: `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10`,
+    baseURL: `https://${shopDomain}/admin/api/2024-10`,
     headers: {
       'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
       'Content-Type': 'application/json',

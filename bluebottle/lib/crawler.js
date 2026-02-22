@@ -72,7 +72,7 @@ function sleep(ms) {
 // 1. 來源抓取
 // ============================================================
 
-async function fetchAllProducts() {
+async function fetchAllProducts(maxPages = 0) {
   const allProducts = [];
   let page = 1;
   let hasMore = true;
@@ -101,6 +101,9 @@ async function fetchAllProducts() {
         log(`  第 ${page} 頁: ${products.length} 個（累計 ${allProducts.length}）`);
 
         if (products.length < config.source.pageSize) {
+          hasMore = false;
+        } else if (maxPages > 0 && page >= maxPages) {
+          log(`  ⏩ 達到頁數上限 (${maxPages})，停止抓取`);
           hasMore = false;
         } else {
           page++;
@@ -541,15 +544,16 @@ async function testUpload(count = 3) {
   log(`🧪 測試上架模式：上架 ${count} 個商品`);
   log('========================================');
 
-  // Step 1: 抓取來源商品
-  const sourceProducts = await fetchAllProducts();
+  // 只抓第一頁就夠了（最多 250 個）
+  const sourceProducts = await fetchAllProducts(1);
   if (sourceProducts.length === 0) {
     log('❌ 未抓取到任何商品');
     return { created: 0, skipped: 0, errors: 0, total: 0, products: [] };
   }
 
-  // Step 2: 建立分類
-  const productCategories = await buildProductCategoryMap();
+  // 測試模式跳過分類建置（省時），用空 map
+  log('⏩ 測試模式：跳過分類對照表建置');
+  const productCategories = {};
 
   // Step 3: 逐一處理，直到成功上架 N 個
   let created = 0, skipped = 0, errors = 0;

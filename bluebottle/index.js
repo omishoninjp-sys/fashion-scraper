@@ -35,14 +35,21 @@ const state = {
 // ============================================================
 const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '0 6 * * *';
 
-cron.schedule(CRON_SCHEDULE, async () => {
-  log(`⏰ 排程觸發同步 (${CRON_SCHEDULE})`);
-  await runSync();
-}, {
-  timezone: process.env.TZ || 'Asia/Taipei',
-});
-
-log(`📅 排程已設定: ${CRON_SCHEDULE} (${process.env.TZ || 'Asia/Taipei'})`);
+if (CRON_SCHEDULE && CRON_SCHEDULE !== 'false' && CRON_SCHEDULE !== 'off') {
+  try {
+    cron.schedule(CRON_SCHEDULE, async () => {
+      log(`⏰ 排程觸發同步 (${CRON_SCHEDULE})`);
+      await runSync();
+    }, {
+      timezone: process.env.TZ || 'Asia/Taipei',
+    });
+    log(`📅 排程已設定: ${CRON_SCHEDULE} (${process.env.TZ || 'Asia/Taipei'})`);
+  } catch (e) {
+    log(`⚠️ 排程設定失敗 (無效的 cron 表達式: ${CRON_SCHEDULE}): ${e.message}`);
+  }
+} else {
+  log('📅 內建排程已停用 (CRON_SCHEDULE=' + CRON_SCHEDULE + ')');
+}
 
 // ============================================================
 // 同步執行器
@@ -210,9 +217,9 @@ try{const d=await api('POST','/api/fetch-only');showRP('抓取結果',d.count+' 
 alog('✅ 成功抓取 '+d.count+' 個商品');}catch(e){alog('❌ 抓取失敗: '+e.message,1);}
 finally{b.disabled=false;s.style.display='none';}}
 
-async function doPrice(){if(!confirm('確定要重新計算所有商品價格？\\n公式: 日幣/0.7 + 重量(kg)×1250'))return;
+async function doPrice(){if(!confirm('確定要重新計算所有商品價格？\\n公式: 日幣/0.7 + 1250'))return;
 const b=$('b-price'),s=$('sp3');b.disabled=true;s.style.display='inline-block';
-alog('💰 更新價格中 (JPY/0.7 + 重量×1250)...');
+alog('💰 更新價格中 (日幣/0.7 + 1250)...');
 try{const d=await api('POST','/api/price-update');alog('✅ 價格更新完成，'+(d.updated||0)+' 個 variant');
 }catch(e){alog('❌ 更新失敗: '+e.message,1);}finally{b.disabled=false;s.style.display='none';}}
 

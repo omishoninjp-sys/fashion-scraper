@@ -1,27 +1,19 @@
 /**
  * 價格計算工具
- * 公式: 日幣 / 0.7 + 重量(kg) * 1250 = Shopify 零售價
+ * 公式: 日幣 / 0.7 + 1250 = Shopify 零售價（日幣）
  */
 
 const axios = require('axios');
 const { log } = require('./logger');
 
-const DIVISOR = parseFloat(process.env.PRICE_DIVISOR) || 0.7;
-const WEIGHT_MULTIPLIER = parseFloat(process.env.WEIGHT_MULTIPLIER) || 1250;
-const ROUND_TO = parseInt(process.env.PRICE_ROUND_TO) || 10;
-
-function calculatePrice(jpyPrice, weightKg = 0) {
+function calculatePrice(jpyPrice) {
   const jpy = parseFloat(jpyPrice);
   if (isNaN(jpy) || jpy <= 0) return 0;
-
-  const wt = parseFloat(weightKg) || 0;
-  const raw = jpy / DIVISOR + wt * WEIGHT_MULTIPLIER;
-
-  return Math.ceil(raw / ROUND_TO) * ROUND_TO;
+  return Math.ceil(jpy / 0.7 + 1250);
 }
 
 async function updateAllPrices() {
-  log(`💰 價格更新: 公式 = JPY / ${DIVISOR} + 重量(kg) × ${WEIGHT_MULTIPLIER}`);
+  log('💰 價格更新: 公式 = 日幣/0.7 + 1250');
 
   const shop = process.env.SHOPIFY_SHOP || '';
   const shopDomain = shop.includes('.') ? shop : `${shop}.myshopify.com`;
@@ -34,27 +26,31 @@ async function updateAllPrices() {
     },
   });
 
-  let sinceId = 0;
-  let updatedCount = 0;
-  let hasMore = true;
+  let sinceId = 0, updatedCount = 0, hasMore = true;
 
   while (hasMore) {
     const res = await api.get(`/products.json?limit=250&since_id=${sinceId}&vendor=Blue+Bottle+Coffee`);
     const products = res.data.products;
-
     if (products.length === 0) { hasMore = false; break; }
 
     for (const product of products) {
-      for (const variant of product.variants) {
-        const jpyPrice = parseFloat(variant.price);
-        const weightKg = variant.grams ? variant.grams / 1000 : 0;
-        const newPrice = calculatePrice(jpyPrice, weightKg);
+      let originalJpy = null;
+      try {
+        const mfRes = await api.get(`/products/${product.id}/metafields.json?namespace=source&key=original_price_jpy`);
+        const mf = mfRes.data.metafields?.[0];
+        if (mf) originalJpy = parseFloat(mf.value);
+      } catch (e) {}
 
-        if (newPrice > 0) {
+      for (const variant of product.variants) {
+        const jpyBase = originalJpy || parseFloat(variant.price);
+        const newPrice = calculatePrice(jpyBase);
+
+        if (newPrice > 0 && newPrice.toString() !== variant.price) {
           try {
             await api.put(`/variants/${variant.id}.json`, {
               variant: { id: variant.id, price: newPrice.toString() },
             });
+            log(`  💰 ${product.title} | ${variant.title}: ¥${jpyBase} → ¥${newPrice}`);
             updatedCount++;
           } catch (error) {
             log(`  ❌ 更新失敗: ${variant.id} - ${error.message}`);
@@ -63,7 +59,6 @@ async function updateAllPrices() {
         }
       }
     }
-
     sinceId = products[products.length - 1].id;
   }
 

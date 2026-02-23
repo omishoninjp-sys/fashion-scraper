@@ -1164,6 +1164,28 @@ def api_start():
     return jsonify({'success': True, 'message': 'Human Made v3.0 爬蟲已啟動'})
 
 
+@app.route('/api/cron', methods=['GET', 'POST'])
+def api_cron():
+    """給 cron-job.org 呼叫的端點，需帶 token 驗證"""
+    cron_token = os.environ.get('CRON_TOKEN', '')
+    if not cron_token:
+        return jsonify({'success': False, 'error': 'CRON_TOKEN 未設定'}), 403
+
+    # 從 header 或 query string 取 token
+    req_token = request.headers.get('X-Cron-Token', '') or request.args.get('token', '')
+    if req_token != cron_token:
+        return jsonify({'success': False, 'error': '驗證失敗'}), 403
+
+    if scrape_status['running']:
+        return jsonify({'success': False, 'error': '爬取正在進行中'})
+    if not load_shopify_token():
+        return jsonify({'success': False, 'error': '環境變數未設定'})
+
+    threading.Thread(target=run_scrape, daemon=True).start()
+    print(f"[CRON] 定時爬取已觸發")
+    return jsonify({'success': True, 'message': 'Cron 觸發成功', 'time': time.strftime('%Y-%m-%d %H:%M:%S')})
+
+
 @app.route('/api/test-shopify')
 def test_shopify():
     if not load_shopify_token():

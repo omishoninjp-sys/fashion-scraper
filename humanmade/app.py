@@ -9,7 +9,7 @@ v3.0 重大改版：humanmade.jp 已從 Shopify 遷移到自建平台
 - 支援 GraphQL 批次查詢 + Rate Limit 保護
 """
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import requests
 import re
 import json
